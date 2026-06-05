@@ -197,6 +197,9 @@ func TestAIGatewayRouterController_syncAIGatewayRoute(t *testing.T) {
 		require.Equal(t, gwapiv1.HTTPHeaderName(internalapi.BackendNameHeaderKey), appleRoute.Spec.Rules[0].Matches[0].Headers[0].Name)
 		require.Equal(t, "ns1.apple", appleRoute.Spec.Rules[0].Matches[0].Headers[0].Value)
 		require.Equal(t, gwapiv1.HTTPHeaderName(internalapi.ModelNameHeaderKeyDefault), appleRoute.Spec.Rules[0].Matches[0].Headers[1].Name)
+		require.NotNil(t, appleRoute.Spec.Rules[0].Matches[0].Headers[1].Type)
+		require.Equal(t, gwapiv1.HeaderMatchRegularExpression, *appleRoute.Spec.Rules[0].Matches[0].Headers[1].Type)
+		require.Equal(t, ".+", appleRoute.Spec.Rules[0].Matches[0].Headers[1].Value)
 
 		var orangeRoute gwapiv1.HTTPRoute
 		err = fakeClient.Get(t.Context(), client.ObjectKey{Name: "myroute-orange-sticky", Namespace: "ns1"}, &orangeRoute)
@@ -226,6 +229,86 @@ func TestAIGatewayRouterController_syncAIGatewayRoute(t *testing.T) {
 		ok, _ = ctrlutil.HasOwnerReference(notFoundFilter.OwnerReferences, route, fakeClient.Scheme())
 		require.True(t, ok, "expected notFoundFilter to have owner reference to AIGatewayRoute")
 	})
+}
+
+func Test_newStickyPerBackendRefHTTPRoute_OpenAIFilesAPIStickyRouting(t *testing.T) {
+	fakeClient := requireNewFakeClientWithIndexes(t)
+	eventCh := internaltesting.NewControllerEventChan[*gwapiv1.Gateway]()
+	c := NewAIGatewayRouteController(fakeClient, nil, logr.Discard(), eventCh.Ch, "/v1")
+
+	backend := &aigv1b1.AIServiceBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "openai-primary", Namespace: "default"},
+		Spec: aigv1b1.AIServiceBackendSpec{
+			APISchema: aigv1b1.VersionedAPISchema{Name: aigv1b1.APISchemaOpenAI, Version: ptr.To("v1")},
+			BackendRef: gwapiv1.BackendObjectReference{
+				Name:      "provider-backend",
+				Namespace: ptr.To(gwapiv1.Namespace("default")),
+			},
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), backend))
+
+	aiGatewayRoute := &aigv1b1.AIGatewayRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "files-route", Namespace: "default"},
+		Spec: aigv1b1.AIGatewayRouteSpec{
+			ParentRefs: []gwapiv1a2.ParentReference{{Name: "gw"}},
+		},
+	}
+
+	dst := &gwapiv1.HTTPRoute{ObjectMeta: metav1.ObjectMeta{Name: "files-route-openai-primary-sticky", Namespace: "default"}}
+	backendRef := &aigv1b1.AIGatewayRouteRuleBackendRef{Name: "openai-primary", Weight: ptr.To[int32](1)}
+
+	require.NoError(t, c.newStickyPerBackendRefHTTPRoute(t.Context(), dst, aiGatewayRoute, backendRef, nil))
+	require.Len(t, dst.Spec.Rules, 1)
+	require.Len(t, dst.Spec.Rules[0].Matches, 1)
+	require.Len(t, dst.Spec.Rules[0].Matches[0].Headers, 2)
+
+	backendMatcher := dst.Spec.Rules[0].Matches[0].Headers[0]
+	require.Equal(t, gwapiv1.HTTPHeaderName(internalapi.BackendNameHeaderKey), backendMatcher.Name)
+	require.Equal(t, "default.openai-primary", backendMatcher.Value)
+	require.Nil(t, backendMatcher.Type)
+
+	modelMatcher := dst.Spec.Rules[0].Matches[0].Headers[1]
+	require.Equal(t, gwapiv1.HTTPHeaderName(internalapi.ModelNameHeaderKeyDefault), modelMatcher.Name)
+	require.NotNil(t, modelMatcher.Type)
+	require.Equal(t, gwapiv1.HeaderMatchRegularExpression, *modelMatcher.Type)
+	require.Equal(t, ".+", modelMatcher.Value)
+}
+
+func TestAIGatewayRouteController_deleteOrphanedPerBackendResources(t *testing.T) {
+	fakeClient := requireNewFakeClientWithIndexes(t)
+	eventCh := internaltesting.NewControllerEventChan[*gwapiv1.Gateway]()
+	c := NewAIGatewayRouteController(fakeClient, nil, logr.Discard(), eventCh.Ch, "/v1")
+
+	toDelete := &gwapiv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "orphan-route", Namespace: "default"},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), toDelete))
+
+	err := c.deleteOrphanedPerBackendResources(t.Context(), map[string]*gwapiv1.HTTPRoute{
+		toDelete.Name: toDelete,
+	})
+	require.NoError(t, err)
+
+	var fetched gwapiv1.HTTPRoute
+	err = fakeClient.Get(t.Context(), client.ObjectKey{Name: toDelete.Name, Namespace: toDelete.Namespace}, &fetched)
+	require.Error(t, err)
+	require.NoError(t, client.IgnoreNotFound(err))
+}
+
+func TestAIGatewayRouteController_deleteOrphanedPerBackendResources_NotFoundIgnored(t *testing.T) {
+	fakeClient := requireNewFakeClientWithIndexes(t)
+	eventCh := internaltesting.NewControllerEventChan[*gwapiv1.Gateway]()
+	c := NewAIGatewayRouteController(fakeClient, nil, logr.Discard(), eventCh.Ch, "/v1")
+
+	nonexistent := &gwapiv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "already-gone", Namespace: "default"},
+	}
+
+	err := c.deleteOrphanedPerBackendResources(t.Context(), map[string]*gwapiv1.HTTPRoute{
+		nonexistent.Name: nonexistent,
+	})
+	require.NoError(t, err)
 }
 
 func Test_newHTTPRoute(t *testing.T) {
