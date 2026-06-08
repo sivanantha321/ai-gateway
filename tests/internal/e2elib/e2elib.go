@@ -428,8 +428,82 @@ func installEnvoyGateway(ctx context.Context, namespace string, inferenceExtensi
 	if err = helm.Run(); err != nil {
 		return
 	}
-	return nil
-}
+
+	// EG v1.8.1+ gates readiness on cache sync (cacheReadyCheck), which requires all
+	// informer caches—including those for backendResources—to complete an initial List.
+	// The EG Helm chart RBAC doesn't cover extension-managed CRDs like InferencePool,
+	// so the informer gets 403s and the pod never becomes ready. Grant access explicitly.
+	if inferenceExtension {
+		initLog("\tGranting Envoy Gateway RBAC for InferencePool resources")
+		if err = KubectlApplyManifestStdin(ctx, `
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: eg-inference-pool-access
+rules:
+- apiGroups:
+  - inference.networking.k8s.io
+  resources:
+  - inferencepools
+  verbs:
+  - get
+  - list
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: eg-inference-pool-access
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: eg-inference-pool-access
+subjects:
+- kind: ServiceAccount
+  name: envoy-gateway
+  namespace: envoy-gateway-system
+`); err != nil {
+			return fmt.Errorf("failed to apply InferencePool RBAC: %w", err)
+		}
+	}
+
+	// EG v1.8.1+ gates readiness on cache sync (cacheReadyCheck), which requires all
+	// informer caches—including those for backendResources—to complete an initial List.
+	// The EG Helm chart RBAC doesn't cover extension-managed CRDs like InferencePool,
+	// so the informer gets 403s and the pod never becomes ready. Grant access explicitly.
+	if inferenceExtension {
+		initLog("\tGranting Envoy Gateway RBAC for InferencePool resources")
+		if err = KubectlApplyManifestStdin(ctx, `
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: eg-inference-pool-access
+rules:
+- apiGroups:
+  - inference.networking.k8s.io
+  resources:
+  - inferencepools
+  verbs:
+  - get
+  - list
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: eg-inference-pool-access
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: eg-inference-pool-access
+subjects:
+- kind: ServiceAccount
+  name: envoy-gateway
+  namespace: envoy-gateway-system
+`); err != nil {
+			return fmt.Errorf("failed to apply InferencePool RBAC: %w", err)
+		}
+	}
 
 func waitForEnvoyGateway(ctx context.Context) (err error) {
 	initLog("\tWaiting for Envoy Gateway deployment to be ready")
