@@ -1202,7 +1202,7 @@ func TestResponseModel_GCPVertexAIEmbeddings_EmbedContent(t *testing.T) {
 		},
 	}
 	reqBody, _ := json.Marshal(req)
-	headers, _, err := translator.RequestBody(reqBody, req, false)
+	headers, _, err := translator.RequestBody(map[string]string{}, reqBody, req, false)
 	require.NoError(t, err)
 
 	// Verify embedContent path was selected.

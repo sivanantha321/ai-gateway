@@ -113,18 +113,14 @@ func SetupAll(ctx context.Context, clusterName string, aigwOpts AIGatewayHelmOpt
 			return fmt.Errorf("failed to install inference pool environment: %w", err)
 		}
 	}
-	if err := installEnvoyGateway(ctx, aigwOpts.GetNamespace(), inferenceExtension); err != nil {
-		return fmt.Errorf("failed to install Envoy Gateway: %w", err)
+	if err := initEnvoyGateway(ctx, aigwOpts.GetNamespace(), inferenceExtension); err != nil {
+		return fmt.Errorf("failed to initialize Envoy Gateway: %w", err)
 	}
 
-	// Install AI Gateway after Envoy Gateway CRDs exist, but before waiting for the Envoy Gateway
-	// deployment to become available, since Envoy Gateway needs inferencepool clusterrole created by the AI Gateway Helm chart to be able to initialize properly.
 	if err := InstallOrUpgradeAIGateway(ctx, aigwOpts); err != nil {
 		return fmt.Errorf("failed to install or upgrade AI Gateway: %w", err)
 	}
-	if err := waitForEnvoyGateway(ctx); err != nil {
-		return fmt.Errorf("failed to initialize Envoy Gateway: %w", err)
-	}
+
 	if needPrometheus {
 		if err := initPrometheus(ctx); err != nil {
 			return fmt.Errorf("failed to initialize Prometheus: %w", err)
@@ -399,9 +395,9 @@ func installInferencePoolEnvironment(ctx context.Context) (err error) {
 	return nil
 }
 
-// installEnvoyGateway installs the Envoy Gateway Helm release following the quickstart guide:
+// initEnvoyGateway initializes the Envoy Gateway in the kind cluster following the quickstart guide:
 // https://gateway.envoyproxy.io/latest/tasks/quickstart/
-func installEnvoyGateway(ctx context.Context, namespace string, inferenceExtension bool) (err error) {
+func initEnvoyGateway(ctx context.Context, namespace string, inferenceExtension bool) (err error) {
 	egVersion := cmp.Or(os.Getenv("EG_VERSION"), "v0.0.0-latest")
 	initLog("Installing Envoy Gateway")
 	start := time.Now()
@@ -467,45 +463,6 @@ subjects:
 		}
 	}
 
-	// EG v1.8.1+ gates readiness on cache sync (cacheReadyCheck), which requires all
-	// informer caches—including those for backendResources—to complete an initial List.
-	// The EG Helm chart RBAC doesn't cover extension-managed CRDs like InferencePool,
-	// so the informer gets 403s and the pod never becomes ready. Grant access explicitly.
-	if inferenceExtension {
-		initLog("\tGranting Envoy Gateway RBAC for InferencePool resources")
-		if err = KubectlApplyManifestStdin(ctx, `
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: eg-inference-pool-access
-rules:
-- apiGroups:
-  - inference.networking.k8s.io
-  resources:
-  - inferencepools
-  verbs:
-  - get
-  - list
-  - watch
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: eg-inference-pool-access
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: eg-inference-pool-access
-subjects:
-- kind: ServiceAccount
-  name: envoy-gateway
-  namespace: envoy-gateway-system
-`); err != nil {
-			return fmt.Errorf("failed to apply InferencePool RBAC: %w", err)
-		}
-	}
-
-func waitForEnvoyGateway(ctx context.Context) (err error) {
 	initLog("\tWaiting for Envoy Gateway deployment to be ready")
 	return kubectlWaitForDeploymentReady(ctx, "envoy-gateway-system", "envoy-gateway")
 }
