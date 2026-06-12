@@ -159,7 +159,7 @@ func Test_chatCompletionProcessorRouterFilter_ProcessRequestBody(t *testing.T) {
 		require.NotNil(t, re.RequestBody)
 		setHeaders := headerValueOptionsToMap(re.RequestBody.GetResponse().GetHeaderMutation().SetHeaders)
 		require.Equal(t, "some-model", setHeaders[internalapi.ModelNameHeaderKeyDefault])
-		require.Equal(t, "openai-primary", setHeaders[internalapi.BackendNameHeaderKey])
+		require.NotContains(t, setHeaders, internalapi.BackendNameHeaderKey)
 		require.Equal(t, "/foo", setHeaders[internalapi.OriginalPathHeader])
 		require.Equal(t, "/foo", setHeaders[internalapi.EnvoyOriginalPathHeader])
 	})
@@ -355,7 +355,15 @@ func Test_retrieveFileContentProcessorRouterFilter_ProcessRequestHeaders(t *test
 
 		mutatedHeaders := headerValueOptionsToMap(headersResp.RequestHeaders.Response.HeaderMutation.SetHeaders)
 		require.Equal(t, noModelPlaceholder, mutatedHeaders[internalapi.ModelNameHeaderKeyDefault])
-		require.Equal(t, "openai-primary", mutatedHeaders[internalapi.BackendNameHeaderKey])
+		require.NotContains(t, mutatedHeaders, internalapi.BackendNameHeaderKey)
+		require.Equal(t,
+			"openai-primary",
+			resp.GetDynamicMetadata().
+				GetFields()[internalapi.AIGatewayFilterMetadataNamespace].
+				GetStructValue().
+				GetFields()[internalapi.AIGatewaySelectedBackndMetadataKey].
+				GetStringValue(),
+		)
 		require.NotContains(t, mutatedHeaders, internalapi.DecodedFileIDHeaderKey)
 		require.NotContains(t, mutatedHeaders, internalapi.OriginalFileIDHeaderKey)
 		require.Equal(t, path, mutatedHeaders[internalapi.OriginalPathHeader])
@@ -452,7 +460,15 @@ func Test_retrieveFileContentProcessorRouterFilter_ProcessRequestHeaders(t *test
 		require.Equal(t, "file-raw123", mutatedHeaders[internalapi.OriginalFileIDHeaderKey])
 		require.Equal(t, "file-raw123", mutatedHeaders[internalapi.DecodedFileIDHeaderKey])
 		require.Equal(t, noModelPlaceholder, mutatedHeaders[internalapi.ModelNameHeaderKeyDefault])
-		require.Equal(t, "azure-openai", mutatedHeaders[internalapi.BackendNameHeaderKey])
+		require.NotContains(t, mutatedHeaders, internalapi.BackendNameHeaderKey)
+		require.Equal(t,
+			"azure-openai",
+			resp.GetDynamicMetadata().
+				GetFields()[internalapi.AIGatewayFilterMetadataNamespace].
+				GetStructValue().
+				GetFields()[internalapi.AIGatewaySelectedBackndMetadataKey].
+				GetStringValue(),
+		)
 
 		require.Equal(t, "file-raw123", p.requestHeaders[internalapi.OriginalFileIDHeaderKey])
 		require.Equal(t, "file-raw123", p.requestHeaders[internalapi.DecodedFileIDHeaderKey])
@@ -486,7 +502,15 @@ func Test_retrieveFileContentProcessorRouterFilter_ProcessRequestHeaders(t *test
 		require.Equal(t, encodedID, mutatedHeaders[internalapi.OriginalFileIDHeaderKey])
 		require.Equal(t, "file-abc123", mutatedHeaders[internalapi.DecodedFileIDHeaderKey])
 		require.Equal(t, "gpt-4o-mini", mutatedHeaders[internalapi.ModelNameHeaderKeyDefault])
-		require.Equal(t, "azure-openai", mutatedHeaders[internalapi.BackendNameHeaderKey])
+		require.NotContains(t, mutatedHeaders, internalapi.BackendNameHeaderKey)
+		require.Equal(t,
+			"azure-openai",
+			resp.GetDynamicMetadata().
+				GetFields()[internalapi.AIGatewayFilterMetadataNamespace].
+				GetStructValue().
+				GetFields()[internalapi.AIGatewaySelectedBackndMetadataKey].
+				GetStringValue(),
+		)
 		require.NotContains(t, mutatedHeaders, internalapi.OriginalPathHeader)
 		require.NotContains(t, mutatedHeaders, internalapi.EnvoyOriginalPathHeader)
 
@@ -518,6 +542,7 @@ func Test_retrieveFileContentProcessorRouterFilter_ProcessRequestHeaders(t *test
 		require.Equal(t, "file-xyz789", mutatedHeaders[internalapi.DecodedFileIDHeaderKey])
 		require.Equal(t, "claude-3", mutatedHeaders[internalapi.ModelNameHeaderKeyDefault])
 		require.NotContains(t, mutatedHeaders, internalapi.BackendNameHeaderKey)
+		require.Nil(t, resp.GetDynamicMetadata())
 
 		require.NotContains(t, p.requestHeaders, internalapi.BackendNameHeaderKey)
 	})
@@ -941,6 +966,7 @@ func Test_chatCompletionProcessorUpstreamFilter_ProcessRequestHeaders(t *testing
 				headers := map[string]string{
 					":path":                               "/foo",
 					internalapi.ModelNameHeaderKeyDefault: "some-model",
+					internalapi.BackendNameHeaderKey:      "some-backend",
 					"agent-session-id":                    "session-123",
 				}
 				headerMut := []internalapi.Header{{"a", "b"}}
@@ -988,6 +1014,13 @@ func Test_chatCompletionProcessorUpstreamFilter_ProcessRequestHeaders(t *testing
 				require.NotNil(t, md)
 				require.Equal(t, "session-123", md.Fields[internalapi.AIGatewayFilterMetadataNamespace].
 					GetStructValue().Fields["session.id"].GetStringValue())
+				require.Equal(t,
+					"some-backend",
+					md.Fields[internalapi.AIGatewayFilterMetadataNamespace].
+						GetStructValue().
+						Fields[internalapi.AIGatewaySelectedBackndMetadataKey].
+						GetStringValue(),
+				)
 
 				mm.RequireRequestNotCompleted(t)
 				// Verify models were set

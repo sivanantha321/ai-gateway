@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -41,7 +42,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gwaiev1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
-	gwapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	aigv1b1 "github.com/envoyproxy/ai-gateway/api/v1beta1"
 	"github.com/envoyproxy/ai-gateway/internal/controller"
@@ -299,6 +299,11 @@ func Test_maybeModifyCluster(t *testing.T) {
 													),
 												},
 											},
+											envoyLbMetadataNamespace: {
+												Fields: map[string]*structpb.Value{
+													internalapi.AIGatewaySelectedBackndMetadataKey: structpb.NewStringValue("ns.aaa"),
+												},
+											},
 										},
 									},
 								},
@@ -317,12 +322,25 @@ func Test_maybeModifyCluster(t *testing.T) {
 													),
 												},
 											},
+											envoyLbMetadataNamespace: {
+												Fields: map[string]*structpb.Value{
+													internalapi.AIGatewaySelectedBackndMetadataKey: structpb.NewStringValue("ns.bbb"),
+												},
+											},
 										},
 									},
 								},
 							},
 						},
 					},
+				},
+				LbSubsetConfig: &clusterv3.Cluster_LbSubsetConfig{
+					FallbackPolicy: clusterv3.Cluster_LbSubsetConfig_ANY_ENDPOINT,
+					SubsetSelectors: []*clusterv3.Cluster_LbSubsetConfig_LbSubsetSelector{
+						{Keys: []string{internalapi.AIGatewaySelectedBackndMetadataKey}},
+					},
+					LocalityWeightAware: true,
+					ScaleLocalityWeight: true,
 				},
 				TypedExtensionProtocolOptions: map[string]*anypb.Any{
 					"envoy.extensions.upstreams.http.v3.HttpProtocolOptions": mustToAny(t, &httpv3.HttpProtocolOptions{
@@ -469,7 +487,7 @@ func TestMaybeModifyClusterExtended(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	t.Run("sticky per-backend route resolves owner/backend labels", func(t *testing.T) {
+	t.Run("out-of-range translated rule is ignored", func(t *testing.T) {
 		err := c.Create(t.Context(), &aigv1b1.AIGatewayRoute{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "my-route",
@@ -486,24 +504,11 @@ func TestMaybeModifyClusterExtended(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		err = c.Create(t.Context(), &gwapiv1.HTTPRoute{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "my-route-azure-openai-sticky",
-				Namespace: "ns",
-				Labels: map[string]string{
-					internalapi.AIGatewayStickyRouteOwnerLabel:          "my-route",
-					internalapi.AIGatewayStickyRouteOwnerNamespaceLabel: "ns",
-					internalapi.AIGatewayStickyRouteBackendLabel:        "azure-openai",
-				},
-			},
-		})
-		require.NoError(t, err)
-
 		s, err := New(c, logr.Discard(), udsPath, false, nil, nil, "envoy-ai-gateway-ratelimit.envoy-gateway-system", 5, false)
 		require.NoError(t, err)
 
 		cluster := &clusterv3.Cluster{
-			Name: "httproute/ns/my-route-azure-openai-sticky/rule/0",
+			Name: "httproute/ns/my-route/rule/2",
 			LoadAssignment: &endpointv3.ClusterLoadAssignment{
 				Endpoints: []*endpointv3.LocalityLbEndpoints{{
 					LbEndpoints: []*endpointv3.LbEndpoint{{}},
@@ -513,14 +518,7 @@ func TestMaybeModifyClusterExtended(t *testing.T) {
 
 		err = s.maybeModifyCluster(t.Context(), cluster)
 		require.NoError(t, err)
-
-		got := cluster.LoadAssignment.Endpoints[0].LbEndpoints[0].Metadata.
-			FilterMetadata[internalapi.InternalEndpointMetadataNamespace].
-			Fields[internalapi.InternalMetadataBackendNameKey].GetStringValue()
-		require.Equal(t,
-			internalapi.PerRouteRuleRefBackendName("ns", "azure-openai", "my-route", 0, 1),
-			got,
-		)
+		require.Nil(t, cluster.LoadAssignment.Endpoints[0].LbEndpoints[0].Metadata)
 	})
 
 	t.Run("AIGatewayRoute not found", func(t *testing.T) {
@@ -769,7 +767,7 @@ func TestMaybeModifyListenerAndRoutes(t *testing.T) {
 	}
 
 	t.Run("empty listeners and routes", func(_ *testing.T) {
-		err := s.maybeModifyListenerAndRoutes([]*listenerv3.Listener{}, []*routev3.RouteConfiguration{})
+		err := s.maybeModifyListenerAndRoutes(t.Context(), []*listenerv3.Listener{}, []*routev3.RouteConfiguration{})
 		require.NoError(t, err)
 	})
 
@@ -793,7 +791,7 @@ func TestMaybeModifyListenerAndRoutes(t *testing.T) {
 			},
 		}
 
-		err := s.maybeModifyListenerAndRoutes(listeners, routes)
+		err := s.maybeModifyListenerAndRoutes(t.Context(), listeners, routes)
 		require.NoError(t, err)
 		// Should process only normal-listener, not envoy-gateway-listener.
 	})
@@ -820,7 +818,7 @@ func TestMaybeModifyListenerAndRoutes(t *testing.T) {
 			},
 		}
 
-		err := s.maybeModifyListenerAndRoutes([]*listenerv3.Listener{listener}, []*routev3.RouteConfiguration{})
+		err := s.maybeModifyListenerAndRoutes(t.Context(), []*listenerv3.Listener{listener}, []*routev3.RouteConfiguration{})
 		require.NoError(t, err)
 		// Should handle gracefully when no RDS route config name is found.
 	})
@@ -831,7 +829,7 @@ func TestMaybeModifyListenerAndRoutes(t *testing.T) {
 			// No DefaultFilterChain set.
 		}
 
-		err := s.maybeModifyListenerAndRoutes([]*listenerv3.Listener{listener}, []*routev3.RouteConfiguration{})
+		err := s.maybeModifyListenerAndRoutes(t.Context(), []*listenerv3.Listener{listener}, []*routev3.RouteConfiguration{})
 		require.NoError(t, err)
 		// Should handle gracefully when no default filter chain exists.
 	})
@@ -856,7 +854,7 @@ func TestMaybeModifyListenerAndRoutes(t *testing.T) {
 			},
 		}
 
-		err := s.maybeModifyListenerAndRoutes(listeners, routes)
+		err := s.maybeModifyListenerAndRoutes(t.Context(), listeners, routes)
 		require.NoError(t, err)
 		// Should identify and process InferencePool routes.
 	})
@@ -892,7 +890,7 @@ func TestMaybeModifyListenerAndRoutes(t *testing.T) {
 			},
 		}
 
-		err := s.maybeModifyListenerAndRoutes(listeners, routes)
+		err := s.maybeModifyListenerAndRoutes(t.Context(), listeners, routes)
 		require.NoError(t, err)
 
 		// Should handle multiple listeners with different route configurations.
@@ -917,9 +915,142 @@ func TestMaybeModifyListenerAndRoutes(t *testing.T) {
 			},
 		}
 
-		err := s.maybeModifyListenerAndRoutes(listeners, routes)
+		err := s.maybeModifyListenerAndRoutes(t.Context(), listeners, routes)
 		require.NoError(t, err)
 		// Should handle gracefully when referenced route config is not found.
+	})
+}
+
+// TestSynthesizeStickyBackendRoutes tests the synthesizeStickyBackendRoutes function.
+func TestSynthesizeStickyBackendRoutes(t *testing.T) {
+	c := newFakeClient()
+	require.NoError(t, c.Create(t.Context(), &aigv1b1.AIGatewayRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "myroute", Namespace: "ns"},
+		Spec: aigv1b1.AIGatewayRouteSpec{
+			Rules: []aigv1b1.AIGatewayRouteRule{
+				{
+					BackendRefs: []aigv1b1.AIGatewayRouteRuleBackendRef{
+						{Name: "apple"},
+						{Name: "banana"},
+					},
+				},
+				{
+					BackendRefs: []aigv1b1.AIGatewayRouteRuleBackendRef{
+						{Name: "apple"}, // Duplicate across rules; must be synthesized only once.
+					},
+				},
+			},
+		},
+	}))
+
+	s, err := New(c, logr.Discard(), udsPath, false, nil, nil, "envoy-ai-gateway-ratelimit.envoy-gateway-system", 5, false)
+	require.NoError(t, err)
+
+	newVH := func() *routev3.VirtualHost {
+		return &routev3.VirtualHost{
+			Name: "vh",
+			Routes: []*routev3.Route{
+				{
+					Name: "httproute/ns/myroute/rule/0/match/0/example.com",
+					Match: &routev3.RouteMatch{
+						PathSpecifier: &routev3.RouteMatch_Prefix{Prefix: "/"},
+						Headers: []*routev3.HeaderMatcher{
+							{Name: internalapi.ModelNameHeaderKeyDefault},
+						},
+					},
+					Action: &routev3.Route_Route{
+						Route: &routev3.RouteAction{
+							ClusterSpecifier: &routev3.RouteAction_Cluster{Cluster: "httproute/ns/myroute/rule/0"},
+						},
+					},
+				},
+				{
+					Name: "httproute/ns/myroute/rule/1/match/0/example.com",
+					Match: &routev3.RouteMatch{
+						PathSpecifier: &routev3.RouteMatch_Prefix{Prefix: "/"},
+					},
+					Action: &routev3.Route_Route{
+						Route: &routev3.RouteAction{
+							ClusterSpecifier: &routev3.RouteAction_Cluster{Cluster: "httproute/ns/myroute/rule/1"},
+						},
+					},
+				},
+				{
+					Name: "non-ai-gateway-route",
+					Action: &routev3.Route_Route{
+						Route: &routev3.RouteAction{
+							ClusterSpecifier: &routev3.RouteAction_Cluster{Cluster: "some-other-cluster"},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	t.Run("synthesizes one sticky route per unique backend", func(t *testing.T) {
+		vh := newVH()
+		require.NoError(t, s.synthesizeStickyBackendRoutes(t.Context(), vh))
+		require.Len(t, vh.Routes, 5)
+
+		// Sticky routes must be ordered first.
+		sticky := vh.Routes[:2]
+		names := []string{sticky[0].Name, sticky[1].Name}
+		require.ElementsMatch(t, []string{
+			"httproute/ns/myroute/rule/0/match/0/example.com/sticky/ns.apple",
+			"httproute/ns/myroute/rule/0/match/0/example.com/sticky/ns.banana",
+		}, names)
+
+		for _, r := range sticky {
+			backend := r.Name[strings.LastIndex(r.Name, "/sticky/")+len("/sticky/"):]
+			// Rule-selection matchers stripped.
+			require.Empty(t, r.Match.Headers)
+			require.Empty(t, r.Match.QueryParameters)
+			// Dynamic metadata matcher on selected_backnd.
+			require.Len(t, r.Match.DynamicMetadata, 1)
+			mm := r.Match.DynamicMetadata[0]
+			require.Equal(t, aigv1b1.AIGatewayFilterMetadataNamespace, mm.Filter)
+			require.Len(t, mm.Path, 1)
+			require.Equal(t, internalapi.AIGatewaySelectedBackndMetadataKey, mm.Path[0].GetKey())
+			require.Equal(t, backend, mm.GetValue().GetStringMatch().GetExact())
+			// Subset LB MetadataMatch pinning the backend's endpoints.
+			got := r.GetRoute().GetMetadataMatch().
+				FilterMetadata[envoyLbMetadataNamespace].
+				Fields[internalapi.AIGatewaySelectedBackndMetadataKey].GetStringValue()
+			require.Equal(t, backend, got)
+			// Cluster is the source rule's cluster.
+			require.Equal(t, "httproute/ns/myroute/rule/0", r.GetRoute().GetCluster())
+		}
+
+		// Original routes preserved after the sticky ones.
+		require.Equal(t, "httproute/ns/myroute/rule/0/match/0/example.com", vh.Routes[2].Name)
+		require.Equal(t, "httproute/ns/myroute/rule/1/match/0/example.com", vh.Routes[3].Name)
+		require.Equal(t, "non-ai-gateway-route", vh.Routes[4].Name)
+	})
+
+	t.Run("idempotent on repeated invocation", func(t *testing.T) {
+		vh := newVH()
+		require.NoError(t, s.synthesizeStickyBackendRoutes(t.Context(), vh))
+		require.Len(t, vh.Routes, 5)
+		require.NoError(t, s.synthesizeStickyBackendRoutes(t.Context(), vh))
+		require.Len(t, vh.Routes, 5)
+	})
+
+	t.Run("non-AIGatewayRoute owner is skipped", func(t *testing.T) {
+		vh := &routev3.VirtualHost{
+			Name: "vh",
+			Routes: []*routev3.Route{
+				{
+					Name: "httproute/ns/plain-httproute/rule/0/match/0/example.com",
+					Action: &routev3.Route_Route{
+						Route: &routev3.RouteAction{
+							ClusterSpecifier: &routev3.RouteAction_Cluster{Cluster: "httproute/ns/plain-httproute/rule/0"},
+						},
+					},
+				},
+			},
+		}
+		require.NoError(t, s.synthesizeStickyBackendRoutes(t.Context(), vh))
+		require.Len(t, vh.Routes, 1)
 	})
 }
 

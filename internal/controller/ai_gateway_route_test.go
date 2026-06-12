@@ -27,7 +27,6 @@ import (
 	gwapiv1b1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 
 	aigv1b1 "github.com/envoyproxy/ai-gateway/api/v1beta1"
-	"github.com/envoyproxy/ai-gateway/internal/internalapi"
 	internaltesting "github.com/envoyproxy/ai-gateway/internal/testing"
 )
 
@@ -173,7 +172,8 @@ func TestAIGatewayRouterController_syncAIGatewayRoute(t *testing.T) {
 		// - 1 default rule with no backends that matches on path "/" (for route-not-found case)
 		require.Len(t, updatedHTTPRoute.Spec.Rules, 2)
 
-		// General rule with both backends (rule 0 in spec → HTTPRoute index 0).
+		// General rule with both backends (spec rule 0).
+		require.Equal(t, "rule-0", string(*updatedHTTPRoute.Spec.Rules[0].Name))
 		require.Len(t, updatedHTTPRoute.Spec.Rules[0].BackendRefs, 2)
 		require.Equal(t, "some-backend1", string(updatedHTTPRoute.Spec.Rules[0].BackendRefs[0].Name))
 		require.Equal(t, "some-backend2", string(updatedHTTPRoute.Spec.Rules[0].BackendRefs[1].Name))
@@ -181,35 +181,6 @@ func TestAIGatewayRouterController_syncAIGatewayRoute(t *testing.T) {
 		// Default rule
 		require.Empty(t, updatedHTTPRoute.Spec.Rules[1].BackendRefs)
 		require.Equal(t, "/", *updatedHTTPRoute.Spec.Rules[1].Matches[0].Path.Value)
-
-		// Verify per-backend HTTPRoutes are created for sticky routing
-		var appleRoute gwapiv1.HTTPRoute
-		err = fakeClient.Get(t.Context(), client.ObjectKey{Name: "myroute-apple-sticky", Namespace: "ns1"}, &appleRoute)
-		require.NoError(t, err)
-		require.Len(t, appleRoute.Spec.Rules, 1)
-		require.Equal(t, route.Spec.ParentRefs, appleRoute.Spec.ParentRefs)
-		require.Len(t, appleRoute.Spec.Rules[0].BackendRefs, 1)
-		require.Equal(t, "some-backend1", string(appleRoute.Spec.Rules[0].BackendRefs[0].Name))
-		require.Equal(t, route.Spec.Rules[0].GetTimeoutsOrDefault(), appleRoute.Spec.Rules[0].Timeouts)
-		// Verify sticky rule matches on backend + model headers
-		require.Len(t, appleRoute.Spec.Rules[0].Matches, 1)
-		require.Len(t, appleRoute.Spec.Rules[0].Matches[0].Headers, 2)
-		require.Equal(t, gwapiv1.HTTPHeaderName(internalapi.BackendNameHeaderKey), appleRoute.Spec.Rules[0].Matches[0].Headers[0].Name)
-		require.Equal(t, "ns1.apple", appleRoute.Spec.Rules[0].Matches[0].Headers[0].Value)
-		require.Equal(t, gwapiv1.HTTPHeaderName(internalapi.ModelNameHeaderKeyDefault), appleRoute.Spec.Rules[0].Matches[0].Headers[1].Name)
-		require.NotNil(t, appleRoute.Spec.Rules[0].Matches[0].Headers[1].Type)
-		require.Equal(t, gwapiv1.HeaderMatchRegularExpression, *appleRoute.Spec.Rules[0].Matches[0].Headers[1].Type)
-		require.Equal(t, ".+", appleRoute.Spec.Rules[0].Matches[0].Headers[1].Value)
-
-		var orangeRoute gwapiv1.HTTPRoute
-		err = fakeClient.Get(t.Context(), client.ObjectKey{Name: "myroute-orange-sticky", Namespace: "ns1"}, &orangeRoute)
-		require.NoError(t, err)
-		require.Len(t, orangeRoute.Spec.Rules, 1)
-		require.Equal(t, route.Spec.ParentRefs, orangeRoute.Spec.ParentRefs)
-		require.Len(t, orangeRoute.Spec.Rules[0].BackendRefs, 1)
-		require.Equal(t, "some-backend2", string(orangeRoute.Spec.Rules[0].BackendRefs[0].Name))
-		require.Equal(t, "ns1.orange", orangeRoute.Spec.Rules[0].Matches[0].Headers[0].Value)
-		require.Equal(t, route.Spec.Rules[0].GetTimeoutsOrDefault(), orangeRoute.Spec.Rules[0].Timeouts)
 
 		// Check per AIGatewayRoute has the default host rewrite filter.
 		var f egv1a1.HTTPRouteFilter
@@ -229,86 +200,6 @@ func TestAIGatewayRouterController_syncAIGatewayRoute(t *testing.T) {
 		ok, _ = ctrlutil.HasOwnerReference(notFoundFilter.OwnerReferences, route, fakeClient.Scheme())
 		require.True(t, ok, "expected notFoundFilter to have owner reference to AIGatewayRoute")
 	})
-}
-
-func Test_newStickyPerBackendRefHTTPRoute_OpenAIFilesAPIStickyRouting(t *testing.T) {
-	fakeClient := requireNewFakeClientWithIndexes(t)
-	eventCh := internaltesting.NewControllerEventChan[*gwapiv1.Gateway]()
-	c := NewAIGatewayRouteController(fakeClient, nil, logr.Discard(), eventCh.Ch, "/v1")
-
-	backend := &aigv1b1.AIServiceBackend{
-		ObjectMeta: metav1.ObjectMeta{Name: "openai-primary", Namespace: "default"},
-		Spec: aigv1b1.AIServiceBackendSpec{
-			APISchema: aigv1b1.VersionedAPISchema{Name: aigv1b1.APISchemaOpenAI, Version: ptr.To("v1")},
-			BackendRef: gwapiv1.BackendObjectReference{
-				Name:      "provider-backend",
-				Namespace: ptr.To(gwapiv1.Namespace("default")),
-			},
-		},
-	}
-	require.NoError(t, fakeClient.Create(t.Context(), backend))
-
-	aiGatewayRoute := &aigv1b1.AIGatewayRoute{
-		ObjectMeta: metav1.ObjectMeta{Name: "files-route", Namespace: "default"},
-		Spec: aigv1b1.AIGatewayRouteSpec{
-			ParentRefs: []gwapiv1a2.ParentReference{{Name: "gw"}},
-		},
-	}
-
-	dst := &gwapiv1.HTTPRoute{ObjectMeta: metav1.ObjectMeta{Name: "files-route-openai-primary-sticky", Namespace: "default"}}
-	backendRef := &aigv1b1.AIGatewayRouteRuleBackendRef{Name: "openai-primary", Weight: ptr.To[int32](1)}
-
-	require.NoError(t, c.newStickyPerBackendRefHTTPRoute(t.Context(), dst, aiGatewayRoute, backendRef, nil))
-	require.Len(t, dst.Spec.Rules, 1)
-	require.Len(t, dst.Spec.Rules[0].Matches, 1)
-	require.Len(t, dst.Spec.Rules[0].Matches[0].Headers, 2)
-
-	backendMatcher := dst.Spec.Rules[0].Matches[0].Headers[0]
-	require.Equal(t, gwapiv1.HTTPHeaderName(internalapi.BackendNameHeaderKey), backendMatcher.Name)
-	require.Equal(t, "default.openai-primary", backendMatcher.Value)
-	require.Nil(t, backendMatcher.Type)
-
-	modelMatcher := dst.Spec.Rules[0].Matches[0].Headers[1]
-	require.Equal(t, gwapiv1.HTTPHeaderName(internalapi.ModelNameHeaderKeyDefault), modelMatcher.Name)
-	require.NotNil(t, modelMatcher.Type)
-	require.Equal(t, gwapiv1.HeaderMatchRegularExpression, *modelMatcher.Type)
-	require.Equal(t, ".+", modelMatcher.Value)
-}
-
-func TestAIGatewayRouteController_deleteOrphanedPerBackendResources(t *testing.T) {
-	fakeClient := requireNewFakeClientWithIndexes(t)
-	eventCh := internaltesting.NewControllerEventChan[*gwapiv1.Gateway]()
-	c := NewAIGatewayRouteController(fakeClient, nil, logr.Discard(), eventCh.Ch, "/v1")
-
-	toDelete := &gwapiv1.HTTPRoute{
-		ObjectMeta: metav1.ObjectMeta{Name: "orphan-route", Namespace: "default"},
-	}
-	require.NoError(t, fakeClient.Create(t.Context(), toDelete))
-
-	err := c.deleteOrphanedPerBackendResources(t.Context(), map[string]*gwapiv1.HTTPRoute{
-		toDelete.Name: toDelete,
-	})
-	require.NoError(t, err)
-
-	var fetched gwapiv1.HTTPRoute
-	err = fakeClient.Get(t.Context(), client.ObjectKey{Name: toDelete.Name, Namespace: toDelete.Namespace}, &fetched)
-	require.Error(t, err)
-	require.NoError(t, client.IgnoreNotFound(err))
-}
-
-func TestAIGatewayRouteController_deleteOrphanedPerBackendResources_NotFoundIgnored(t *testing.T) {
-	fakeClient := requireNewFakeClientWithIndexes(t)
-	eventCh := internaltesting.NewControllerEventChan[*gwapiv1.Gateway]()
-	c := NewAIGatewayRouteController(fakeClient, nil, logr.Discard(), eventCh.Ch, "/v1")
-
-	nonexistent := &gwapiv1.HTTPRoute{
-		ObjectMeta: metav1.ObjectMeta{Name: "already-gone", Namespace: "default"},
-	}
-
-	err := c.deleteOrphanedPerBackendResources(t.Context(), map[string]*gwapiv1.HTTPRoute{
-		nonexistent.Name: nonexistent,
-	})
-	require.NoError(t, err)
 }
 
 func Test_newHTTPRoute(t *testing.T) {
@@ -417,10 +308,8 @@ func Test_newHTTPRoute(t *testing.T) {
 			}}
 			expPath := &gwapiv1.HTTPPathMatch{Value: ptr.To("/")}
 			expRules := []gwapiv1.HTTPRouteRule{
-				// General model-based routing rules (kept at the same indices as
-				// AIGatewayRoute.Spec.Rules so the extension server can map clusters
-				// httproute/<ns>/<name>/rule/<idx> back to the spec rules).
 				{
+					Name: ptr.To(gwapiv1.SectionName("rule-0")),
 					Matches: []gwapiv1.HTTPRouteMatch{
 						{Headers: []gwapiv1.HTTPHeaderMatch{{Name: "x-test", Value: "rule-0"}}, Path: expPath},
 					},
@@ -429,6 +318,7 @@ func Test_newHTTPRoute(t *testing.T) {
 					Filters:     rewriteFilters,
 				},
 				{
+					Name: ptr.To(gwapiv1.SectionName("rule-1")),
 					Matches: []gwapiv1.HTTPRouteMatch{
 						{Headers: []gwapiv1.HTTPHeaderMatch{{Name: "x-test", Value: "rule-1"}}, Path: expPath},
 					},
@@ -441,6 +331,7 @@ func Test_newHTTPRoute(t *testing.T) {
 					Filters:  rewriteFilters,
 				},
 				{
+					Name: ptr.To(gwapiv1.SectionName("rule-2")),
 					Matches: []gwapiv1.HTTPRouteMatch{
 						{Headers: []gwapiv1.HTTPHeaderMatch{{Name: "x-test", Value: "rule-2"}}, Path: expPath},
 					},

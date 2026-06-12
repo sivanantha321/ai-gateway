@@ -9,6 +9,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -26,6 +29,8 @@ import (
 	upstream_codecv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/upstream_codec/v3"
 	httpconnectionmanagerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	httpv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
+	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -33,7 +38,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	gwaiev1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
-	gwapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	aigv1b1 "github.com/envoyproxy/ai-gateway/api/v1beta1"
 	"github.com/envoyproxy/ai-gateway/internal/internalapi"
@@ -42,6 +46,9 @@ import (
 const (
 	extProcUDSClusterName = "ai-gateway-extproc-uds"
 	aiGatewayExtProcName  = "envoy.filters.http.ext_proc/aigateway"
+	// envoyLbMetadataNamespace is the well-known Envoy filter metadata namespace
+	// consumed by the subset load balancer for endpoint subset selection.
+	envoyLbMetadataNamespace = "envoy.lb"
 )
 
 // PostTranslateModify allows an extension to modify the clusters and secrets in the xDS config
@@ -73,7 +80,7 @@ func (s *Server) PostTranslateModify(ctx context.Context, req *egextension.PostT
 	req.Clusters = append(req.Clusters, cs...)
 
 	// Modify listeners and routes to support InferencePool backends.
-	if err = s.maybeModifyListenerAndRoutes(req.Listeners, req.Routes); err != nil {
+	if err = s.maybeModifyListenerAndRoutes(ctx, req.Listeners, req.Routes); err != nil {
 		return nil, fmt.Errorf("failed to modify listeners and routes for InferencePool support: %w", err)
 	}
 
@@ -188,34 +195,8 @@ func (s *Server) maybeModifyCluster(ctx context.Context, cluster *clusterv3.Clus
 		return nil
 	}
 
-	// Check if this is a per-backend sticky HTTPRoute (name ends with "-<backend>-sticky").
 	aigatewayRouteName := httpRouteName
 	aigatewayRouteNamespace := httpRouteNamespace
-	isStickyRoute := strings.HasSuffix(httpRouteName, "-sticky")
-	stickyBackendName := ""
-	stickyBackendRefIndex := -1
-
-	if isStickyRoute {
-		// For sticky per-backend routes, use labels as the source of truth:
-		// - internalapi.AIGatewayStickyRouteOwnerLabel: original AIGatewayRoute name
-		// - internalapi.AIGatewayStickyRouteOwnerNamespaceLabel: original AIGatewayRoute namespace
-		// - internalapi.AIGatewayStickyRouteBackendLabel: backend ref name
-		var perBackendHTTPRoute gwapiv1.HTTPRoute
-		if err = s.k8sClient.Get(ctx, client.ObjectKey{Namespace: httpRouteNamespace, Name: httpRouteName}, &perBackendHTTPRoute); err != nil {
-			if !apierrors.IsNotFound(err) {
-				s.log.Error(err, "failed to get per-backend HTTPRoute", "namespace", httpRouteNamespace, "name", httpRouteName)
-				return err
-			}
-		} else {
-			if owner := perBackendHTTPRoute.Labels[internalapi.AIGatewayStickyRouteOwnerLabel]; owner != "" {
-				aigatewayRouteName = owner
-			}
-			if ownerNamespace := perBackendHTTPRoute.Labels[internalapi.AIGatewayStickyRouteOwnerNamespaceLabel]; ownerNamespace != "" {
-				aigatewayRouteNamespace = ownerNamespace
-			}
-			stickyBackendName = perBackendHTTPRoute.Labels[internalapi.AIGatewayStickyRouteBackendLabel]
-		}
-	}
 
 	// Check if this rule has InferencePool backends.
 	pool := getInferencePoolByMetadata(cluster.Metadata)
@@ -233,64 +214,23 @@ func (s *Server) maybeModifyCluster(ctx context.Context, cluster *clusterv3.Clus
 		return err
 	}
 
-	// For per-backend sticky HTTPRoutes (which have only one sticky rule),
-	// we need to find the original spec rule and backend ref index.
-	if isStickyRoute {
-		if stickyBackendName == "" {
-			s.log.Info("Could not extract backend name from per-backend HTTPRoute",
-				"cluster_name", cluster.Name, "httproute_name", httpRouteName, "aigw_route_name", aigatewayRouteName)
-			return nil
-		}
-
-		// Find the spec rule and backend ref that matches this backend
-		found := false
-		for specIdx, rule := range aigwRoute.Spec.Rules {
-			for refIdx, br := range rule.BackendRefs {
-				if br.Name == stickyBackendName {
-					httpRouteRuleIndex = specIdx
-					stickyBackendRefIndex = refIdx
-					found = true
-					break
-				}
-			}
-			if found {
-				break
-			}
-		}
-		if !found {
-			s.log.Info("Could not find matching spec rule for sticky backend",
-				"cluster_name", cluster.Name, "backend_name", stickyBackendName)
-			return nil
-		}
-	}
-
-	// Validate that the rule index is within bounds.
-	// Sticky rules are now in separate per-backend HTTPRoutes, so the main HTTPRoute
-	// only contains regular rules (Spec.Rules) and the route-not-found rule at the end.
-	if httpRouteRuleIndex >= len(aigwRoute.Spec.Rules) {
-		// This could be the route-not-found rule or an out-of-range index.
-		// Skip processing for these cases.
+	ruleResolution, ok := resolveAIGatewayRouteRule(&aigwRoute, httpRouteRuleIndex)
+	if !ok {
 		s.log.Info("HTTPRoute rule index out of range",
 			"cluster_name", cluster.Name, "rule_index", httpRouteRuleIndexStr)
 		return nil
 	}
-	httpRouteRule := &aigwRoute.Spec.Rules[httpRouteRuleIndex]
+	httpRouteRuleIndex = ruleResolution.specRuleIndex
+	httpRouteRule := ruleResolution.rule
 
 	// Only process LoadAssignment for non-InferencePool backends.
 	if pool == nil {
-		// For regular rules, use all backendRefs as defined in the spec.
-		// For sticky per-backend HTTPRoutes, use only the matched backend ref.
+		// Use all backendRefs as defined in the spec rule. Per-backend sticky
+		// selection is done via subset load balancing (envoy.lb endpoint metadata
+		// + route-level MetadataMatch on synthesized sticky routes), not by
+		// separate per-backend clusters.
 		backendRefs := httpRouteRule.BackendRefs
 		backendRefIdxOffset := 0
-		if isStickyRoute {
-			if stickyBackendRefIndex < 0 || stickyBackendRefIndex >= len(httpRouteRule.BackendRefs) {
-				s.log.Info("Sticky backend ref index out of range",
-					"cluster_name", cluster.Name, "backend_ref_index", stickyBackendRefIndex)
-				return nil
-			}
-			backendRefIdxOffset = stickyBackendRefIndex
-			backendRefs = []aigv1b1.AIGatewayRouteRuleBackendRef{httpRouteRule.BackendRefs[stickyBackendRefIndex]}
-		}
 		if cluster.LoadAssignment == nil {
 			// When LoadAssignment is nil (e.g. EDS-managed endpoints in standalone mode),
 			// set backend name on cluster-level metadata so the upstream ext_proc filter
@@ -341,7 +281,32 @@ func (s *Server) maybeModifyCluster(ctx context.Context, cluster *clusterv3.Clus
 					m.Fields[internalapi.InternalMetadataBackendNameKey] = structpb.NewStringValue(
 						internalapi.PerRouteRuleRefBackendName(namespace, name, aigwRoute.Name, httpRouteRuleIndex, i+backendRefIdxOffset),
 					)
+					// Tag the endpoint with the namespace-qualified backend name under the
+					// well-known "envoy.lb" namespace so synthesized sticky routes can pin
+					// requests to this backend's endpoints via subset load balancing.
+					lbm, ok := endpoint.Metadata.FilterMetadata[envoyLbMetadataNamespace]
+					if !ok {
+						lbm = &structpb.Struct{}
+						endpoint.Metadata.FilterMetadata[envoyLbMetadataNamespace] = lbm
+					}
+					if lbm.Fields == nil {
+						lbm.Fields = make(map[string]*structpb.Value)
+					}
+					lbm.Fields[internalapi.AIGatewaySelectedBackndMetadataKey] = structpb.NewStringValue(
+						fmt.Sprintf("%s.%s", backendRef.GetNamespace(aigwRoute.Namespace), name),
+					)
 				}
+			}
+			// Enable subset load balancing keyed by the sticky backend tag. Non-sticky
+			// requests carry no subset match criteria and fall back to the full endpoint
+			// set (ANY_ENDPOINT), preserving the regular weighted/priority LB behavior.
+			cluster.LbSubsetConfig = &clusterv3.Cluster_LbSubsetConfig{
+				FallbackPolicy: clusterv3.Cluster_LbSubsetConfig_ANY_ENDPOINT,
+				SubsetSelectors: []*clusterv3.Cluster_LbSubsetConfig_LbSubsetSelector{
+					{Keys: []string{internalapi.AIGatewaySelectedBackndMetadataKey}},
+				},
+				LocalityWeightAware: true,
+				ScaleLocalityWeight: true,
 			}
 		}
 	} else {
@@ -477,7 +442,7 @@ func (s *Server) maybeModifyCluster(ctx context.Context, cluster *clusterv3.Clus
 // 2. Adds endpoint picker (EPP) external processor filters to relevant listeners
 // 3. Configures per-route filters to disable EPP processing for non-InferencePool routes
 // This ensures that only routes targeting InferencePool backends go through the endpoint picker.
-func (s *Server) maybeModifyListenerAndRoutes(listeners []*listenerv3.Listener, routes []*routev3.RouteConfiguration) error {
+func (s *Server) maybeModifyListenerAndRoutes(ctx context.Context, listeners []*listenerv3.Listener, routes []*routev3.RouteConfiguration) error {
 	listenerNameToRouteNames := make(map[string][]string)
 	listenerNameToListener := make(map[string]*listenerv3.Listener)
 	for _, listener := range listeners {
@@ -558,7 +523,7 @@ func (s *Server) maybeModifyListenerAndRoutes(listeners []*listenerv3.Listener, 
 				s.log.Info("skipping patching of non-existent route config", "route_config", name)
 				continue
 			}
-			_enabled, err := s.enableRouterLevelAIGatewayExtProcOnRoute(routeCfg)
+			_enabled, err := s.enableRouterLevelAIGatewayExtProcOnRoute(ctx, routeCfg)
 			if err != nil {
 				return fmt.Errorf("failed to enable router level AI Gateway extproc on route config %s: %w", name, err)
 			}
@@ -668,7 +633,13 @@ func (s *Server) patchVirtualHostWithInferencePool(vh *routev3.VirtualHost, infe
 // enableRouterLevelAIGatewayExtProcOnRoute checks if the extproc filter should be enabled for routes
 // that are generated by AIGateway. It modifies the route configuration to enable the extproc filter
 // for those routes. It returns true if any route was modified.
-func (s *Server) enableRouterLevelAIGatewayExtProcOnRoute(routeConfig *routev3.RouteConfiguration) (bool, error) {
+//
+// It also synthesizes per-backend sticky routes: for each unique backend referenced
+// by an owning AIGatewayRoute, a translated rule route is cloned, its rule-selection
+// header matchers are stripped, and a dynamic metadata matcher on
+// internalapi.AIGatewayFilterMetadataNamespace/selected_backnd is injected so the
+// route only matches when ext_proc has selected that backend.
+func (s *Server) enableRouterLevelAIGatewayExtProcOnRoute(ctx context.Context, routeConfig *routev3.RouteConfiguration) (bool, error) {
 	enabled := false
 	fcAny, err := toAny(&routev3.FilterConfig{
 		Config: &anypb.Any{},
@@ -698,8 +669,186 @@ func (s *Server) enableRouterLevelAIGatewayExtProcOnRoute(routeConfig *routev3.R
 				ensureRouteInternalMetadata(route).Fields[internalapi.InternalMetadataRouteNameKey] = structpb.NewStringValue(routeName)
 			}
 		}
+		if enabled {
+			if err := s.synthesizeStickyBackendRoutes(ctx, vh); err != nil {
+				return false, fmt.Errorf("failed to synthesize sticky backend routes for virtual host %s: %w", vh.Name, err)
+			}
+		}
 	}
 	return enabled, nil
+}
+
+// synthesizeStickyBackendRoutes appends one sticky route per unique backend referenced
+// by the AIGatewayRoutes owning the AI-gateway-generated routes in the virtual host.
+// Each sticky route is a clone of the first translated route of a rule containing the
+// backend, with rule-selection matchers stripped, a selected_backnd dynamic metadata
+// matcher injected, and a subset LB MetadataMatch pinning the backend's endpoints.
+// Sticky routes are then moved to the front of the virtual host so they take priority
+// over the general and route-not-found routes; they only match when ext_proc has set
+// the sticky dynamic metadata, so they never steal non-sticky traffic.
+func (s *Server) synthesizeStickyBackendRoutes(ctx context.Context, vh *routev3.VirtualHost) error {
+	// Map cluster name ("httproute/<ns>/<name>/rule/<i>") -> source route per rule,
+	// and collect the owning AIGatewayRoutes.
+	type ruleKey struct {
+		namespace, name string
+		ruleIndex       int
+	}
+	ruleToRoute := make(map[ruleKey]*routev3.Route)
+	owners := make(map[client.ObjectKey]struct{})
+	existingNames := make(map[string]struct{}, len(vh.Routes))
+	for _, route := range vh.Routes {
+		existingNames[route.Name] = struct{}{}
+		if routeHasStickyMetadataMatcher(route) {
+			continue // Already-synthesized sticky route (idempotency).
+		}
+		ns, name, ruleIndex, ok := parseAIGatewayClusterName(route.GetRoute().GetCluster())
+		if !ok {
+			continue
+		}
+		key := ruleKey{namespace: ns, name: name, ruleIndex: ruleIndex}
+		if _, exists := ruleToRoute[key]; !exists {
+			ruleToRoute[key] = route
+		}
+		owners[client.ObjectKey{Namespace: ns, Name: name}] = struct{}{}
+	}
+
+	var stickyRoutes []*routev3.Route
+	for _, owner := range slices.SortedFunc(maps.Keys(owners), func(a, b client.ObjectKey) int {
+		return strings.Compare(a.String(), b.String())
+	}) {
+		var aigwRoute aigv1b1.AIGatewayRoute
+		if err := s.k8sClient.Get(ctx, owner, &aigwRoute); err != nil {
+			if apierrors.IsNotFound(err) {
+				// Not an AIGatewayRoute-generated HTTPRoute; nothing to synthesize.
+				continue
+			}
+			return fmt.Errorf("failed to get AIGatewayRoute %s: %w", owner, err)
+		}
+
+		// One sticky route per unique backend, cloned from the first rule containing it.
+		seen := make(map[string]struct{})
+		for i := range aigwRoute.Spec.Rules {
+			for j := range aigwRoute.Spec.Rules[i].BackendRefs {
+				br := &aigwRoute.Spec.Rules[i].BackendRefs[j]
+				stickyBackend := fmt.Sprintf("%s.%s", br.GetNamespace(aigwRoute.Namespace), br.Name)
+				if _, dup := seen[stickyBackend]; dup {
+					continue
+				}
+				seen[stickyBackend] = struct{}{}
+
+				source, ok := ruleToRoute[ruleKey{namespace: owner.Namespace, name: owner.Name, ruleIndex: i}]
+				if !ok {
+					// Rule not translated in this virtual host (e.g. filtered listener); skip.
+					continue
+				}
+				stickyRouteName := fmt.Sprintf("%s/sticky/%s", source.Name, stickyBackend)
+				if _, exists := existingNames[stickyRouteName]; exists {
+					continue // Idempotency: already synthesized.
+				}
+
+				clone, ok := proto.Clone(source).(*routev3.Route)
+				if !ok {
+					return fmt.Errorf("failed to clone route %s", source.Name)
+				}
+				clone.Name = stickyRouteName
+				// Strip rule-selection matchers; the sticky route matches on path plus the
+				// dynamic metadata predicate only.
+				if clone.Match == nil {
+					clone.Match = &routev3.RouteMatch{}
+				}
+				clone.Match.Headers = nil
+				clone.Match.QueryParameters = nil
+				injectStickyBackendMetadataMatcher(clone, stickyBackend)
+				// Pin endpoint selection to this backend's endpoints via subset LB.
+				if ra := clone.GetRoute(); ra != nil {
+					ra.MetadataMatch = &corev3.Metadata{
+						FilterMetadata: map[string]*structpb.Struct{
+							envoyLbMetadataNamespace: {
+								Fields: map[string]*structpb.Value{
+									internalapi.AIGatewaySelectedBackndMetadataKey: structpb.NewStringValue(stickyBackend),
+								},
+							},
+						},
+					}
+				}
+				stickyRoutes = append(stickyRoutes, clone)
+				existingNames[stickyRouteName] = struct{}{}
+				s.log.Info("synthesized sticky backend route",
+					"route", stickyRouteName, "sticky_backend", stickyBackend, "virtual_host", vh.Name)
+			}
+		}
+	}
+
+	if len(stickyRoutes) > 0 {
+		vh.Routes = append(vh.Routes, stickyRoutes...)
+	}
+	// Sticky routes only match when the sticky metadata is set, so placing them first
+	// is safe and required: otherwise they would sit behind the catch-all routes.
+	sortStickyRoutesFirst(vh.Routes)
+	return nil
+}
+
+// parseAIGatewayClusterName parses an Envoy Gateway generated cluster name of the
+// form "httproute/<namespace>/<name>/rule/<index>" into its components.
+func parseAIGatewayClusterName(clusterName string) (namespace, name string, ruleIndex int, ok bool) {
+	parts := strings.Split(clusterName, "/")
+	if len(parts) != 5 || parts[0] != "httproute" || parts[3] != "rule" {
+		return "", "", 0, false
+	}
+	idx, err := strconv.Atoi(parts[4])
+	if err != nil {
+		return "", "", 0, false
+	}
+	return parts[1], parts[2], idx, true
+}
+
+// injectStickyBackendMetadataMatcher augments the route match with a dynamic metadata
+// predicate so the route only matches requests whose ext_proc-set dynamic metadata
+// internalapi.AIGatewayFilterMetadataNamespace/selected_backnd equals stickyBackend.
+func injectStickyBackendMetadataMatcher(route *routev3.Route, stickyBackend string) {
+	if route.Match == nil {
+		route.Match = &routev3.RouteMatch{}
+	}
+	for _, mm := range route.Match.DynamicMetadata {
+		if mm.Filter == aigv1b1.AIGatewayFilterMetadataNamespace &&
+			len(mm.Path) == 1 && mm.Path[0].GetKey() == internalapi.AIGatewaySelectedBackndMetadataKey {
+			return // Already injected.
+		}
+	}
+	route.Match.DynamicMetadata = append(route.Match.DynamicMetadata, &matcherv3.MetadataMatcher{
+		Filter: aigv1b1.AIGatewayFilterMetadataNamespace,
+		Path: []*matcherv3.MetadataMatcher_PathSegment{
+			{Segment: &matcherv3.MetadataMatcher_PathSegment_Key{Key: internalapi.AIGatewaySelectedBackndMetadataKey}},
+		},
+		Value: &matcherv3.ValueMatcher{
+			MatchPattern: &matcherv3.ValueMatcher_StringMatch{
+				StringMatch: &matcherv3.StringMatcher{
+					MatchPattern: &matcherv3.StringMatcher_Exact{Exact: stickyBackend},
+				},
+			},
+		},
+	})
+}
+
+// sortStickyRoutesFirst stably reorders routes so that routes carrying the sticky
+// dynamic metadata matcher come before all other routes.
+func sortStickyRoutesFirst(routes []*routev3.Route) {
+	sort.SliceStable(routes, func(i, j int) bool {
+		return routeHasStickyMetadataMatcher(routes[i]) && !routeHasStickyMetadataMatcher(routes[j])
+	})
+}
+
+func routeHasStickyMetadataMatcher(route *routev3.Route) bool {
+	if route.Match == nil {
+		return false
+	}
+	for _, mm := range route.Match.DynamicMetadata {
+		if mm.Filter == aigv1b1.AIGatewayFilterMetadataNamespace &&
+			len(mm.Path) == 1 && mm.Path[0].GetKey() == internalapi.AIGatewaySelectedBackndMetadataKey {
+			return true
+		}
+	}
+	return false
 }
 
 // insertRouterLevelAIGatewayExtProcExtProc inserts the AI Gateway external processor filter into the listener's filter chains.
@@ -835,6 +984,27 @@ func (s *Server) isRouteGeneratedByAIGateway(route *routev3.Route) bool {
 		}
 	}
 	return false
+}
+
+type resolvedAIGatewayRouteRule struct {
+	specRuleIndex int
+	rule          *aigv1b1.AIGatewayRouteRule
+}
+
+func resolveAIGatewayRouteRule(aigwRoute *aigv1b1.AIGatewayRoute, translatedRuleIndex int) (*resolvedAIGatewayRouteRule, bool) {
+	if translatedRuleIndex < 0 || aigwRoute == nil {
+		return nil, false
+	}
+
+	specRuleCount := len(aigwRoute.Spec.Rules)
+	if translatedRuleIndex < specRuleCount {
+		return &resolvedAIGatewayRouteRule{
+			specRuleIndex: translatedRuleIndex,
+			rule:          &aigwRoute.Spec.Rules[translatedRuleIndex],
+		}, true
+	}
+
+	return nil, false
 }
 
 func routeNameFromRouteConfigName(routeConfigName string) string {
