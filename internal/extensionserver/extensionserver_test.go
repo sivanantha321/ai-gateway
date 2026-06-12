@@ -26,6 +26,8 @@ import (
 	htomv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/header_to_metadata/v3"
 	upstream_codecv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/upstream_codec/v3"
 	httpconnectionmanagerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+	round_robinv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/load_balancing_policies/round_robin/v3"
+	subsetv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/load_balancing_policies/subset/v3"
 	httpv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
 	"github.com/go-logr/logr"
@@ -334,13 +336,28 @@ func Test_maybeModifyCluster(t *testing.T) {
 						},
 					},
 				},
-				LbSubsetConfig: &clusterv3.Cluster_LbSubsetConfig{
-					FallbackPolicy: clusterv3.Cluster_LbSubsetConfig_ANY_ENDPOINT,
-					SubsetSelectors: []*clusterv3.Cluster_LbSubsetConfig_LbSubsetSelector{
-						{Keys: []string{internalapi.AIGatewaySelectedBackndMetadataKey}},
-					},
-					LocalityWeightAware: true,
-					ScaleLocalityWeight: true,
+				LoadBalancingPolicy: &clusterv3.LoadBalancingPolicy{
+					Policies: []*clusterv3.LoadBalancingPolicy_Policy{{
+						TypedExtensionConfig: &corev3.TypedExtensionConfig{
+							Name: stickySubsetLbPolicyName,
+							TypedConfig: mustToAny(t, &subsetv3.Subset{
+								FallbackPolicy: subsetv3.Subset_ANY_ENDPOINT,
+								SubsetSelectors: []*subsetv3.Subset_LbSubsetSelector{
+									{Keys: []string{internalapi.AIGatewaySelectedBackndMetadataKey}},
+								},
+								LocalityWeightAware: true,
+								ScaleLocalityWeight: true,
+								SubsetLbPolicy: &clusterv3.LoadBalancingPolicy{
+									Policies: []*clusterv3.LoadBalancingPolicy_Policy{{
+										TypedExtensionConfig: &corev3.TypedExtensionConfig{
+											Name:        "envoy.load_balancing_policies.round_robin",
+											TypedConfig: mustToAny(t, &round_robinv3.RoundRobin{}),
+										},
+									}},
+								},
+							}),
+						},
+					}},
 				},
 				TypedExtensionProtocolOptions: map[string]*anypb.Any{
 					"envoy.extensions.upstreams.http.v3.HttpProtocolOptions": mustToAny(t, &httpv3.HttpProtocolOptions{

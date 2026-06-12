@@ -28,6 +28,8 @@ import (
 	header_mutationv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/header_mutation/v3"
 	upstream_codecv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/upstream_codec/v3"
 	httpconnectionmanagerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+	round_robinv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/load_balancing_policies/round_robin/v3"
+	subsetv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/load_balancing_policies/subset/v3"
 	httpv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	"google.golang.org/protobuf/proto"
@@ -300,13 +302,8 @@ func (s *Server) maybeModifyCluster(ctx context.Context, cluster *clusterv3.Clus
 			// Enable subset load balancing keyed by the sticky backend tag. Non-sticky
 			// requests carry no subset match criteria and fall back to the full endpoint
 			// set (ANY_ENDPOINT), preserving the regular weighted/priority LB behavior.
-			cluster.LbSubsetConfig = &clusterv3.Cluster_LbSubsetConfig{
-				FallbackPolicy: clusterv3.Cluster_LbSubsetConfig_ANY_ENDPOINT,
-				SubsetSelectors: []*clusterv3.Cluster_LbSubsetConfig_LbSubsetSelector{
-					{Keys: []string{internalapi.AIGatewaySelectedBackndMetadataKey}},
-				},
-				LocalityWeightAware: true,
-				ScaleLocalityWeight: true,
+			if err := wrapClusterLbPolicyWithStickySubset(cluster); err != nil {
+				return fmt.Errorf("failed to configure sticky subset load balancing for cluster %s: %w", cluster.Name, err)
 			}
 		}
 	} else {
@@ -1090,6 +1087,64 @@ func setClusterMetadataBackendName(cluster *clusterv3.Cluster, namespace, name, 
 	m.Fields[internalapi.InternalMetadataBackendNameKey] = structpb.NewStringValue(
 		internalapi.PerRouteRuleRefBackendName(namespace, name, routeName, routeRuleIndex, refIndex),
 	)
+}
+
+// stickySubsetLbPolicyName is the canonical extension name of Envoy's subset
+// load balancing policy.
+const stickySubsetLbPolicyName = "envoy.load_balancing_policies.subset"
+
+// wrapClusterLbPolicyWithStickySubset wraps the cluster's load balancing policy
+// with the subset LB policy extension keyed by the sticky backend tag so that
+// synthesized sticky routes can pin requests to a specific backend's endpoints.
+//
+// Envoy Gateway sets the modern Cluster.load_balancing_policy field, which Envoy
+// rejects when combined with the legacy Cluster.lb_subset_config, so the subset
+// behavior must be expressed as a load_balancing_policy extension wrapping the
+// existing policy. Non-sticky requests carry no subset match criteria and fall
+// back to the full endpoint set (ANY_ENDPOINT), preserving the regular
+// weighted/priority LB behavior.
+func wrapClusterLbPolicyWithStickySubset(cluster *clusterv3.Cluster) error {
+	// Idempotency: skip if the outermost policy is already the subset extension.
+	if policies := cluster.GetLoadBalancingPolicy().GetPolicies(); len(policies) > 0 &&
+		policies[0].GetTypedExtensionConfig().GetTypedConfig().MessageIs(&subsetv3.Subset{}) {
+		return nil
+	}
+	inner := cluster.LoadBalancingPolicy
+	if inner == nil {
+		rr, err := anypb.New(&round_robinv3.RoundRobin{})
+		if err != nil {
+			return fmt.Errorf("failed to marshal round robin LB policy: %w", err)
+		}
+		inner = &clusterv3.LoadBalancingPolicy{
+			Policies: []*clusterv3.LoadBalancingPolicy_Policy{{
+				TypedExtensionConfig: &corev3.TypedExtensionConfig{
+					Name:        "envoy.load_balancing_policies.round_robin",
+					TypedConfig: rr,
+				},
+			}},
+		}
+	}
+	subset, err := anypb.New(&subsetv3.Subset{
+		FallbackPolicy: subsetv3.Subset_ANY_ENDPOINT,
+		SubsetSelectors: []*subsetv3.Subset_LbSubsetSelector{
+			{Keys: []string{internalapi.AIGatewaySelectedBackndMetadataKey}},
+		},
+		LocalityWeightAware: true,
+		ScaleLocalityWeight: true,
+		SubsetLbPolicy:      inner,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to marshal subset LB policy: %w", err)
+	}
+	cluster.LoadBalancingPolicy = &clusterv3.LoadBalancingPolicy{
+		Policies: []*clusterv3.LoadBalancingPolicy_Policy{{
+			TypedExtensionConfig: &corev3.TypedExtensionConfig{
+				Name:        stickySubsetLbPolicyName,
+				TypedConfig: subset,
+			},
+		}},
+	}
+	return nil
 }
 
 func shouldAIGatewayExtProcBeInserted(filters []*httpconnectionmanagerv3.HttpFilter) bool {
