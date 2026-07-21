@@ -85,7 +85,7 @@ func TestOpenAIBatchesTranslators_ResponseBody(t *testing.T) {
 		require.NoError(t, err)
 		require.Nil(t, hdrs)
 		require.Nil(t, body) // body passes through unchanged; processor re-encodes ids.
-		require.Equal(t, "gpt-5-2025-08-07", string(model))
+		require.Equal(t, "gpt-5-2025-08-07", model)
 
 		in, ok := usage.InputTokens()
 		require.True(t, ok)

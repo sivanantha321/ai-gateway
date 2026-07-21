@@ -481,7 +481,7 @@ func TestBatchProcessResponseBody_ReEncodeResponse(t *testing.T) {
 
 	// Batch id must be gateway-encoded (kind batch).
 	batchID := gjson.GetBytes(mutated, "id").String()
-	require.True(t, len(batchID) > 0)
+	require.NotEmpty(t, batchID)
 	decoded, err := codec.Decode(batchID)
 	require.NoError(t, err)
 	require.Equal(t, idcodec.KindBatch, decoded.Kind)

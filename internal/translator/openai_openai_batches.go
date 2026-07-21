@@ -6,11 +6,11 @@
 package translator
 
 import (
-	"encoding/json"
 	"io"
 
 	"github.com/envoyproxy/ai-gateway/internal/apischema/openai"
 	"github.com/envoyproxy/ai-gateway/internal/internalapi"
+	internaljson "github.com/envoyproxy/ai-gateway/internal/json"
 	"github.com/envoyproxy/ai-gateway/internal/metrics"
 )
 
@@ -109,10 +109,10 @@ func (*openAIBatchRetrieveTranslator) ResponseBody(_ map[string]string, body io.
 		return nil, nil, metrics.TokenUsage{}, "", nil
 	}
 	var batch openai.Batch
-	if unmarshalErr := json.Unmarshal(raw, &batch); unmarshalErr != nil {
+	if unmarshalErr := internaljson.Unmarshal(raw, &batch); unmarshalErr != nil {
 		return nil, nil, metrics.TokenUsage{}, "", nil
 	}
-	return nil, nil, batchTokenUsage(&batch), internalapi.ResponseModel(batch.Model), nil
+	return nil, nil, batchTokenUsage(&batch), batch.Model, nil
 }
 
 // ResponseError implements [Translator.ResponseError]. OpenAI error envelopes pass through unchanged.
