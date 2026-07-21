@@ -35,6 +35,7 @@ const (
 	GenAIOperationTranslation     GenAIOperation = "translation"
 	GenAIOperationRerank          GenAIOperation = "rerank"
 	GenAIOperationTokenize        GenAIOperation = "tokenize"
+	GenAIOperationBatch           GenAIOperation = "batch"
 
 	// Provider names according to the Semantic Conventions for Generative AI Metrics.
 	// See: https://opentelemetry.io/docs/specs/semconv/attributes-registry/gen-ai/
