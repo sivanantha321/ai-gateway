@@ -323,6 +323,7 @@ func Main(ctx context.Context, args []string, stderr io.Writer) (err error) {
 	translationMetricsFactory := metrics.NewMetricsFactory(meter, metricsRequestHeaderAttributes, metrics.GenAIOperationTranslation)
 	rerankMetricsFactory := metrics.NewMetricsFactory(meter, metricsRequestHeaderAttributes, metrics.GenAIOperationRerank)
 	tokenizeMetricsFactory := metrics.NewMetricsFactory(meter, metricsRequestHeaderAttributes, metrics.GenAIOperationTokenize)
+	batchMetricsFactory := metrics.NewMetricsFactory(meter, metricsRequestHeaderAttributes, metrics.GenAIOperationBatch)
 	mcpMetrics := metrics.NewMCP(meter, metricsRequestHeaderAttributes)
 
 	extproc.LogRequestHeaderAttributes = logRequestHeaderAttributes
@@ -360,6 +361,12 @@ func Main(ctx context.Context, args []string, stderr io.Writer) (err error) {
 	// under a single prefix processor that routes by encoded backend id.
 	server.RegisterPrefix(path.Join(flags.rootPrefix, endpointPrefixes.OpenAI, "/v1/files"),
 		extproc.NewFilesProcessorFactory(newFileIDCodec(&flags)))
+
+	// Register the OpenAI Batch API endpoints (/v1/batches, /v1/batches/{id}, /v1/batches/{id}/cancel)
+	// under a single prefix processor that routes by encoded backend id. Shares the same id codec as
+	// the Files API so that file ids embedded in batch responses are consumable by the Files API.
+	server.RegisterPrefix(path.Join(flags.rootPrefix, endpointPrefixes.OpenAI, "/v1/batches"),
+		extproc.NewBatchesProcessorFactory(newFileIDCodec(&flags), batchMetricsFactory))
 
 	// Create and register gRPC server with ExternalProcessorServer (the service Envoy calls).
 	if err = startConfigWatcher(ctx, &flags, server, l, time.Second*5); err != nil {
