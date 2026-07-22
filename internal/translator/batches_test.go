@@ -122,9 +122,9 @@ func TestOpenAIBatchesTranslators_ResponseBody(t *testing.T) {
 		require.False(t, ok)
 	})
 
-	t.Run("retrieve degrades to zero usage on malformed body", func(t *testing.T) {
+	t.Run("retrieve returns error on malformed body", func(t *testing.T) {
 		hdrs, body, usage, model, err := retrieve.ResponseBody(map[string]string{}, bytes.NewReader([]byte(`not json`)), true, nil)
-		require.NoError(t, err)
+		require.Error(t, err)
 		require.Nil(t, hdrs)
 		require.Nil(t, body)
 		require.Empty(t, model)

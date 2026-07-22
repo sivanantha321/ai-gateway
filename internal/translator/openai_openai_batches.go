@@ -6,6 +6,7 @@
 package translator
 
 import (
+	"fmt"
 	"io"
 
 	"github.com/envoyproxy/ai-gateway/internal/apischema/openai"
@@ -95,8 +96,8 @@ func (*openAIBatchRetrieveTranslator) ResponseHeaders(map[string]string) (
 // ResponseBody implements [Translator.ResponseBody]. The batch retrieve body carries a batch-level
 // "usage" object (present for batches created after 2025-09-07). It is extracted into a
 // metrics.TokenUsage so the processor can record it. The body itself passes through unchanged (the
-// processor re-encodes native ids into gateway ids on the raw response); on any parse failure this
-// degrades to zero usage rather than failing the client's retrieve.
+// processor re-encodes native ids into gateway ids on the raw response). A read or parse failure
+// returns an error so the processor can log it; the retrieve still succeeds via pass-through.
 func (*openAIBatchRetrieveTranslator) ResponseBody(_ map[string]string, body io.Reader, _ bool, _ any) (
 	newHeaders []internalapi.Header,
 	mutatedBody []byte,
@@ -106,11 +107,11 @@ func (*openAIBatchRetrieveTranslator) ResponseBody(_ map[string]string, body io.
 ) {
 	raw, readErr := io.ReadAll(body)
 	if readErr != nil {
-		return nil, nil, metrics.TokenUsage{}, "", nil
+		return nil, nil, metrics.TokenUsage{}, "", fmt.Errorf("reading batch retrieve response body: %w", readErr)
 	}
 	var batch openai.Batch
 	if unmarshalErr := internaljson.Unmarshal(raw, &batch); unmarshalErr != nil {
-		return nil, nil, metrics.TokenUsage{}, "", nil
+		return nil, nil, metrics.TokenUsage{}, "", fmt.Errorf("parsing batch retrieve response body: %w", unmarshalErr)
 	}
 	return nil, nil, batchTokenUsage(&batch), batch.Model, nil
 }
