@@ -497,6 +497,66 @@ func TestBatchProcessResponseBody_ReEncodeResponse(t *testing.T) {
 	}
 }
 
+// TestBatchProcessResponseBody_FailClosed asserts that when a batch response cannot be safely
+// re-encoded, the processor returns a 502 rather than leaking the backend-native body.
+func TestBatchProcessResponseBody_FailClosed(t *testing.T) {
+	codec := newTestCodec()
+	openAISchema := filterapi.VersionedAPISchema{Name: filterapi.APISchemaOpenAI}
+
+	newProc := func(op batchOperation, backendKnown bool, tr translator.BatchesTranslator) *batchesProcessor {
+		return &batchesProcessor{
+			codec:            codec,
+			config:           runtimeConfigWithSchema("ns", "apple", "myroute", openAISchema),
+			requestHeaders:   map[string]string{},
+			logger:           slog.Default(),
+			metricsFactory:   &mockMetricsFactory{},
+			op:               op,
+			backendNamespace: "ns",
+			backendName:      "apple",
+			backendKnown:     backendKnown,
+			translator:       tr,
+			responseHeaders:  map[string]string{},
+		}
+	}
+
+	assert502 := func(t *testing.T, resp *extprocv3.ProcessingResponse, err error) {
+		t.Helper()
+		require.NoError(t, err)
+		require.NotNil(t, resp.GetImmediateResponse())
+		require.Equal(t, int32(http.StatusBadGateway), int32(resp.GetImmediateResponse().Status.Code))
+	}
+
+	t.Run("create: backend not known", func(t *testing.T) {
+		p := newProc(batchOpCreate, false, mustBatchCreateTranslator(t, openAISchema))
+		resp, err := p.ProcessResponseBody(context.Background(), &extprocv3.HttpBody{Body: []byte(`{"id":"batch-native1"}`)})
+		assert502(t, resp, err)
+	})
+
+	t.Run("create: empty body", func(t *testing.T) {
+		p := newProc(batchOpCreate, true, mustBatchCreateTranslator(t, openAISchema))
+		resp, err := p.ProcessResponseBody(context.Background(), &extprocv3.HttpBody{Body: nil})
+		assert502(t, resp, err)
+	})
+
+	t.Run("create: missing id", func(t *testing.T) {
+		p := newProc(batchOpCreate, true, mustBatchCreateTranslator(t, openAISchema))
+		resp, err := p.ProcessResponseBody(context.Background(), &extprocv3.HttpBody{Body: []byte(`{"object":"batch"}`)})
+		assert502(t, resp, err)
+	})
+
+	t.Run("list: non-array data", func(t *testing.T) {
+		p := newProc(batchOpList, true, mustBatchListTranslator(t, openAISchema))
+		resp, err := p.ProcessResponseBody(context.Background(), &extprocv3.HttpBody{Body: []byte(`{"error":{"message":"boom"}}`)})
+		assert502(t, resp, err)
+	})
+
+	t.Run("list: backend not known", func(t *testing.T) {
+		p := newProc(batchOpList, false, mustBatchListTranslator(t, openAISchema))
+		resp, err := p.ProcessResponseBody(context.Background(), &extprocv3.HttpBody{Body: []byte(`{"data":[]}`)})
+		assert502(t, resp, err)
+	})
+}
+
 func TestBatchProcessResponseBody_RetrieveRecordsMetrics(t *testing.T) {
 	codec := newTestCodec()
 	openAISchema := filterapi.VersionedAPISchema{Name: filterapi.APISchemaOpenAI}

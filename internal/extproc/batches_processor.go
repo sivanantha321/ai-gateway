@@ -410,10 +410,15 @@ func (p *batchesProcessor) ProcessResponseBody(ctx context.Context, body *extpro
 
 // reEncodeResponse rewrites the batch id + embedded file ids in a JSON response into gateway-
 // encoded ids (create/retrieve/cancel). For retrieve, token usage is also recorded. On any failure
-// it passes the body through unchanged.
+// it returns a 502 rather than forwarding the upstream body, which would leak backend-native ids.
 func (p *batchesProcessor) reEncodeResponse(ctx context.Context, raw []byte) *extprocv3.ProcessingResponse {
-	if !p.backendKnown || len(raw) == 0 {
-		return passThroughResponseBody()
+	if !p.backendKnown {
+		p.logger.Error("backend unknown; cannot re-encode batches response ids")
+		return batchesReEncodeError("backend unknown for upstream batches response")
+	}
+	if len(raw) == 0 {
+		p.logger.Error("empty body; cannot re-encode batches response ids")
+		return batchesReEncodeError("empty body in upstream batches response")
 	}
 
 	workingBody := raw
@@ -421,7 +426,7 @@ func (p *batchesProcessor) reEncodeResponse(ctx context.Context, raw []byte) *ex
 		_, mutatedBody, tokenUsage, responseModel, err := p.translator.ResponseBody(p.responseHeaders, bytes.NewReader(raw), true, nil)
 		if err != nil {
 			p.logger.Error("failed to translate response body", slog.String("error", err.Error()))
-			return passThroughResponseBody()
+			return batchesReEncodeError("failed to process upstream batches response")
 		}
 		if mutatedBody != nil {
 			workingBody = mutatedBody
@@ -438,17 +443,18 @@ func (p *batchesProcessor) reEncodeResponse(ctx context.Context, raw []byte) *ex
 	// Re-encode the top-level batch id (kind batch).
 	nativeBatchID := gjson.GetBytes(workingBody, "id").String()
 	if nativeBatchID == "" {
-		return passThroughResponseBody()
+		p.logger.Error("missing id field; cannot re-encode batches response")
+		return batchesReEncodeError("missing id in upstream batches response")
 	}
 	gwBatchID, err := p.encodeBatchID(nativeBatchID)
 	if err != nil {
-		p.logger.Warn("failed to re-encode batch response id, passing through", slog.String("error", err.Error()))
-		return passThroughResponseBody()
+		p.logger.Error("failed to re-encode batch response id", slog.String("error", err.Error()))
+		return batchesReEncodeError("failed to encode batch id in upstream batches response")
 	}
 	workingBody, err = sjson.SetBytes(workingBody, "id", gwBatchID)
 	if err != nil {
-		p.logger.Warn("failed to set batch id in response, passing through", slog.String("error", err.Error()))
-		return passThroughResponseBody()
+		p.logger.Error("failed to set batch id in response", slog.String("error", err.Error()))
+		return batchesReEncodeError("failed to encode batch id in upstream batches response")
 	}
 
 	// Re-encode the embedded file ids (kind file). Missing/null fields are skipped.
@@ -459,13 +465,13 @@ func (p *batchesProcessor) reEncodeResponse(ctx context.Context, raw []byte) *ex
 		}
 		gwFileID, encErr := p.encodeFileID(nativeFileID)
 		if encErr != nil {
-			p.logger.Warn("failed to re-encode file id field, passing through", slog.String("field", field), slog.String("error", encErr.Error()))
-			return passThroughResponseBody()
+			p.logger.Error("failed to re-encode file id field", slog.String("field", field), slog.String("error", encErr.Error()))
+			return batchesReEncodeError("failed to encode file id in upstream batches response")
 		}
 		workingBody, err = sjson.SetBytes(workingBody, field, gwFileID)
 		if err != nil {
-			p.logger.Warn("failed to set file id field in response, passing through", slog.String("field", field), slog.String("error", err.Error()))
-			return passThroughResponseBody()
+			p.logger.Error("failed to set file id field in response", slog.String("field", field), slog.String("error", err.Error()))
+			return batchesReEncodeError("failed to encode file id in upstream batches response")
 		}
 	}
 
@@ -475,11 +481,17 @@ func (p *batchesProcessor) reEncodeResponse(ctx context.Context, raw []byte) *ex
 // buildListWalkResponse re-encodes every data[].id + embedded file ids for the serving backend
 // and stitches this single-backend page into the cross-backend walk.
 func (p *batchesProcessor) buildListWalkResponse(raw []byte) *extprocv3.ProcessingResponse {
-	if !p.backendKnown || len(raw) == 0 {
-		return passThroughResponseBody()
+	if !p.backendKnown {
+		p.logger.Error("backend unknown; cannot re-encode batches list response ids")
+		return batchesReEncodeError("backend unknown for upstream batches list response")
+	}
+	if len(raw) == 0 {
+		p.logger.Error("empty body; cannot re-encode batches list response ids")
+		return batchesReEncodeError("empty body in upstream batches list response")
 	}
 	if !gjson.GetBytes(raw, "data").IsArray() {
-		return passThroughResponseBody()
+		p.logger.Error("non-list body; cannot re-encode batches list response ids")
+		return batchesReEncodeError("invalid or non-list body in upstream batches list response")
 	}
 
 	workingBody := raw
@@ -487,7 +499,7 @@ func (p *batchesProcessor) buildListWalkResponse(raw []byte) *extprocv3.Processi
 		_, mutatedBody, _, _, err := p.translator.ResponseBody(p.responseHeaders, bytes.NewReader(raw), true, nil)
 		if err != nil {
 			p.logger.Error("failed to translate response body for batches list endpoint", slog.String("error", err.Error()))
-			return passThroughResponseBody()
+			return batchesReEncodeError("failed to process upstream batches list response")
 		}
 		if mutatedBody != nil {
 			workingBody = mutatedBody
@@ -539,8 +551,8 @@ func (p *batchesProcessor) buildListWalkResponse(raw []byte) *extprocv3.Processi
 		}
 	}
 	if err != nil {
-		p.logger.Warn("failed to re-encode batches list ids, passing through", slog.String("error", err.Error()))
-		return passThroughResponseBody()
+		p.logger.Error("failed to re-encode batches list ids", slog.String("error", err.Error()))
+		return batchesReEncodeError("failed to encode id in upstream batches list response")
 	}
 
 	// Never leak the backend-native first_id; re-encode it when present.
@@ -572,8 +584,8 @@ func (p *batchesProcessor) buildListWalkResponse(raw []byte) *extprocv3.Processi
 		}
 	}
 	if newBody, err = sjson.SetBytes(newBody, "has_more", hasMore); err != nil {
-		p.logger.Warn("failed to set has_more on batches list, passing through", slog.String("error", err.Error()))
-		return passThroughResponseBody()
+		p.logger.Error("failed to set has_more on batches list", slog.String("error", err.Error()))
+		return batchesReEncodeError("failed to encode upstream batches list response")
 	}
 	return bodyMutationResponse(newBody)
 }
@@ -715,4 +727,12 @@ func (p *batchesProcessor) resolveTranslator(schema filterapi.VersionedAPISchema
 	}
 	p.translator = t
 	return nil
+}
+
+// batchesReEncodeError returns an ImmediateResponse (HTTP 502) for cases where a batch or file id
+// could not be safely re-encoded. Forwarding the upstream body unchanged in these cases would leak
+// backend-native ids to the client, so a controlled error is returned instead. It is returned with
+// a nil Go error so the ext_proc stream stays intact.
+func batchesReEncodeError(msg string) *extprocv3.ProcessingResponse {
+	return createUserFacingErrorResponse(http.StatusBadGateway, "upstream_error", msg)
 }
