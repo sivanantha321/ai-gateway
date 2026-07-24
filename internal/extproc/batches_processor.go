@@ -102,6 +102,12 @@ type batchesProcessor struct {
 	translator translator.BatchesTranslator
 	// responseHeaders captures the upstream response headers for ResponseBody translator calls.
 	responseHeaders map[string]string
+
+	// gatewayInputFileID is the original gateway-issued input_file_id the client sent in a create
+	// request. Stored in ProcessRequestBody so the response path can echo it back verbatim instead
+	// of re-encoding the native ID with a fresh nonce (which produces a functionally identical but
+	// visually different ID, confusing clients that compare the uploaded file id to the batch's).
+	gatewayInputFileID string
 }
 
 var _ Processor = (*batchesProcessor)(nil)
@@ -345,6 +351,8 @@ func (p *batchesProcessor) ProcessRequestBody(_ context.Context, rawBody *extpro
 	p.backendName = decoded.Name
 	p.backendKnown = true
 	p.backendFromDecode = true
+	// Stash the original gateway ID so the create response can echo it back verbatim.
+	p.gatewayInputFileID = gatewayFileID
 
 	schema, ok := p.schemaForBackend(p.config, decoded.Namespace, decoded.Name)
 	if !ok {
@@ -463,10 +471,17 @@ func (p *batchesProcessor) reEncodeResponse(ctx context.Context, raw []byte) *ex
 		if nativeFileID == "" {
 			continue
 		}
-		gwFileID, encErr := p.encodeFileID(nativeFileID)
-		if encErr != nil {
-			p.logger.Error("failed to re-encode file id field", slog.String("field", field), slog.String("error", encErr.Error()))
-			return batchesReEncodeError("failed to encode file id in upstream batches response")
+		// For input_file_id on a create response, reuse the exact gateway ID the client sent
+		// rather than re-encoding the native ID with a fresh nonce (which would produce a
+		// functionally identical but visually different ID).
+		gwFileID := p.gatewayInputFileID
+		if field != "input_file_id" || gwFileID == "" {
+			var encErr error
+			gwFileID, encErr = p.encodeFileID(nativeFileID)
+			if encErr != nil {
+				p.logger.Error("failed to re-encode file id field", slog.String("field", field), slog.String("error", encErr.Error()))
+				return batchesReEncodeError("failed to encode file id in upstream batches response")
+			}
 		}
 		workingBody, err = sjson.SetBytes(workingBody, field, gwFileID)
 		if err != nil {
