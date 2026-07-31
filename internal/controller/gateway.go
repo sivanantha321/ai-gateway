@@ -472,6 +472,14 @@ func (c *GatewayController) reconcileFilterConfigSecret(
 					b.BodyMutation = bodyMutationToFilterAPI(mergedBodyMutation)
 
 					b.Schema = schemaToFilterAPI(backendObj.Spec.APISchema)
+
+					// Wire GCP context caching configuration when present on the backend object.
+					if backendObj.Spec.GCPContextCaching != nil {
+						b.GCPContextCaching = &filterapi.GCPContextCaching{
+							Enabled:    backendObj.Spec.GCPContextCaching.Enabled,
+							DefaultTTL: backendObj.Spec.GCPContextCaching.DefaultTTL,
+						}
+					}
 				}
 
 				if bsp != nil {
