@@ -3537,8 +3537,8 @@ func TestGatewayController_reconcileFilterConfigSecret_GCPContextCaching(t *test
 	fakeClient := requireNewFakeClientWithIndexes(t)
 	kube := fake2.NewClientset()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zap.Options{Development: true, Level: zapcore.DebugLevel})))
-	c := NewGatewayController(fakeClient, kube, ctrl.Log, "envoy-gateway-system",
-		"docker.io/envoyproxy/ai-gateway-extproc:latest", "info", false, nil, true)
+	opts := newTestExtProcOptions("docker.io/envoyproxy/ai-gateway-extproc:latest", "info")
+	c := NewGatewayController(fakeClient, kube, ctrl.Log, "envoy-gateway-system", false, nil, opts, true)
 
 	routes := []aigv1b1.AIGatewayRoute{
 		{
@@ -3598,8 +3598,8 @@ func TestGatewayController_reconcileFilterConfigSecret_GCPContextCaching_NilWhen
 	fakeClient := requireNewFakeClientWithIndexes(t)
 	kube := fake2.NewClientset()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zap.Options{Development: true, Level: zapcore.DebugLevel})))
-	c := NewGatewayController(fakeClient, kube, ctrl.Log, "envoy-gateway-system",
-		"docker.io/envoyproxy/ai-gateway-extproc:latest", "info", false, nil, true)
+	opts := newTestExtProcOptions("docker.io/envoyproxy/ai-gateway-extproc:latest", "info")
+	c := NewGatewayController(fakeClient, kube, ctrl.Log, "envoy-gateway-system", false, nil, opts, true)
 
 	routes := []aigv1b1.AIGatewayRoute{
 		{
