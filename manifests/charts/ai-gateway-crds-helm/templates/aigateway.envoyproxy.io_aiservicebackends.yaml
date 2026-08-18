@@ -240,6 +240,28 @@ spec:
                       When false, cache_control markers in requests are ignored and no cachedContents
                       API calls are made.
                     type: boolean
+                  redis:
+                    description: |-
+                      Redis identifies the shared store that records which cachedContents entry a given
+                      request prefix resolved to. Sharing that state across gateway replicas is what
+                      prevents two replicas from independently creating a cache for the same prefix.
+
+                      When omitted, context caching is inert: cache_control markers are still parsed,
+                      but no cache is resolved or created and requests are served uncached. Setting
+                      enabled: true without a redis block is therefore valid and silently does nothing.
+
+                      If Redis is unreachable at request time, caching is skipped and the request is
+                      served uncached rather than failed.
+                    properties:
+                      url:
+                        description: |-
+                          URL is the address of the Redis instance, given either as a bare "host:port"
+                          (e.g. "redis.default.svc.cluster.local:6379") or as a full "redis://" URL.
+                        minLength: 1
+                        type: string
+                    required:
+                    - url
+                    type: object
                 required:
                 - enabled
                 type: object
@@ -679,6 +701,28 @@ spec:
                       When false, cache_control markers in requests are ignored and no cachedContents
                       API calls are made.
                     type: boolean
+                  redis:
+                    description: |-
+                      Redis identifies the shared store that records which cachedContents entry a given
+                      request prefix resolved to. Sharing that state across gateway replicas is what
+                      prevents two replicas from independently creating a cache for the same prefix.
+
+                      When omitted, context caching is inert: cache_control markers are still parsed,
+                      but no cache is resolved or created and requests are served uncached. Setting
+                      enabled: true without a redis block is therefore valid and silently does nothing.
+
+                      If Redis is unreachable at request time, caching is skipped and the request is
+                      served uncached rather than failed.
+                    properties:
+                      url:
+                        description: |-
+                          URL is the address of the Redis instance, given either as a bare "host:port"
+                          (e.g. "redis.default.svc.cluster.local:6379") or as a full "redis://" URL.
+                        minLength: 1
+                        type: string
+                    required:
+                    - url
+                    type: object
                 required:
                 - enabled
                 type: object

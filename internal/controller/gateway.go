@@ -464,10 +464,13 @@ func (c *GatewayController) reconcileFilterConfigSecret(
 					b.Schema = schemaToFilterAPI(backendObj.Spec.APISchema)
 
 					// Wire GCP context caching configuration when present on the backend object.
-					if backendObj.Spec.GCPContextCaching != nil {
+					if cc := backendObj.Spec.GCPContextCaching; cc != nil {
 						b.GCPContextCaching = &filterapi.GCPContextCaching{
-							Enabled:    backendObj.Spec.GCPContextCaching.Enabled,
-							DefaultTTL: backendObj.Spec.GCPContextCaching.DefaultTTL,
+							Enabled:    cc.Enabled,
+							DefaultTTL: cc.DefaultTTL,
+						}
+						if cc.Redis != nil {
+							b.GCPContextCaching.Redis = &filterapi.GCPCacheRedis{URL: cc.Redis.URL}
 						}
 					}
 				}

@@ -3567,6 +3567,7 @@ func TestGatewayController_reconcileFilterConfigSecret_GCPContextCaching(t *test
 			GCPContextCaching: &aigv1b1.GCPContextCachingSpec{
 				Enabled:    true,
 				DefaultTTL: "600s",
+				Redis:      &aigv1b1.GCPCacheRedisSpec{URL: "redis.default.svc.cluster.local:6379"},
 			},
 		},
 	})
@@ -3589,6 +3590,8 @@ func TestGatewayController_reconcileFilterConfigSecret_GCPContextCaching(t *test
 	require.NotNil(t, gcpBackend.GCPContextCaching, "GCPContextCaching must be populated in filter config")
 	require.True(t, gcpBackend.GCPContextCaching.Enabled)
 	require.Equal(t, "600s", gcpBackend.GCPContextCaching.DefaultTTL)
+	require.NotNil(t, gcpBackend.GCPContextCaching.Redis, "the redis store location must reach the data plane")
+	require.Equal(t, "redis.default.svc.cluster.local:6379", gcpBackend.GCPContextCaching.Redis.URL)
 }
 
 // TestGatewayController_reconcileFilterConfigSecret_GCPContextCaching_NilWhenAbsent verifies that

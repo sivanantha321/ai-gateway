@@ -213,6 +213,21 @@ type GCPContextCaching struct {
 	// as a GCP duration string (e.g. "600s"). When empty, the resolver default (300s) is used.
 	// +optional
 	DefaultTTL string `json:"defaultTTL,omitempty"`
+	// Redis points at the shared store that records which cachedContents entry a given
+	// prefix resolved to. It is what stops two gateway replicas from independently
+	// creating a cache for the same prefix.
+	//
+	// When nil, context caching is inert: markers are still parsed, but nothing is
+	// resolved or created, and requests are served uncached. Enabled: true without a
+	// redis block is therefore legal and silently does nothing.
+	// +optional
+	Redis *GCPCacheRedis `json:"redis,omitempty"`
+}
+
+// GCPCacheRedis locates the Redis instance backing the context cache store.
+type GCPCacheRedis struct {
+	// URL is either a bare "host:port" or a full "redis://" URL.
+	URL string `json:"url"`
 }
 
 // BackendAuth corresponds partially to BackendSecurityPolicy in api/v1alpha1/api.go.

@@ -88,7 +88,7 @@ type AIServiceBackendSpec struct {
 	// 	That may be useful for the backend that has a different cost calculation logic.
 }
 
-// GCPContextCachingSpec configures in-process Gemini context caching for a GCP Vertex AI backend.
+// GCPContextCachingSpec configures Gemini context caching for a GCP Vertex AI backend.
 type GCPContextCachingSpec struct {
 	// Enabled controls whether context caching is active for this backend.
 	// When false, cache_control markers in requests are ignored and no cachedContents
@@ -104,4 +104,28 @@ type GCPContextCachingSpec struct {
 	// +optional
 	// +kubebuilder:validation:Pattern=`^[1-9][0-9]*s$`
 	DefaultTTL string `json:"defaultTTL,omitempty"`
+
+	// Redis identifies the shared store that records which cachedContents entry a given
+	// request prefix resolved to. Sharing that state across gateway replicas is what
+	// prevents two replicas from independently creating a cache for the same prefix.
+	//
+	// When omitted, context caching is inert: cache_control markers are still parsed,
+	// but no cache is resolved or created and requests are served uncached. Setting
+	// enabled: true without a redis block is therefore valid and silently does nothing.
+	//
+	// If Redis is unreachable at request time, caching is skipped and the request is
+	// served uncached rather than failed.
+	//
+	// +optional
+	Redis *GCPCacheRedisSpec `json:"redis,omitempty"`
+}
+
+// GCPCacheRedisSpec locates the Redis instance backing the context cache store.
+type GCPCacheRedisSpec struct {
+	// URL is the address of the Redis instance, given either as a bare "host:port"
+	// (e.g. "redis.default.svc.cluster.local:6379") or as a full "redis://" URL.
+	//
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	URL string `json:"url"`
 }

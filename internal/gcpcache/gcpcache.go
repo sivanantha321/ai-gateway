@@ -26,8 +26,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
-	"sync"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -46,6 +46,11 @@ const (
 
 	// gcpCachedContentsBasePath is the base URL for the Vertex AI cachedContents REST API.
 	gcpCachedContentsBasePath = "https://%s-aiplatform.googleapis.com/v1/projects/%s/locations/%s/cachedContents"
+
+	// staleThreshold is how close to its expiry a stored entry must be before it is
+	// treated as a miss, so there is time to re-resolve before the Google cache
+	// disappears underneath an in-flight request.
+	staleThreshold = 10 * time.Second
 )
 
 // ResolveResult holds the outcome of a successful cache resolution.
@@ -75,36 +80,43 @@ type CacheResolver interface {
 	Resolve(ctx context.Context, openAIReq *openai.ChatCompletionRequest, gcpAuth filterapi.GCPAuthHandler) (*ResolveResult, error)
 }
 
-// memoEntry is an in-memory cache entry for resolved Google cache names.
-type memoEntry struct {
-	cacheName  string
-	expireTime time.Time
-}
-
-// resolver is the default in-process CacheResolver implementation.
+// resolver is the default CacheResolver implementation.
 type resolver struct {
 	httpClient *http.Client
 
-	mu   sync.Mutex
-	memo map[string]memoEntry // key → memoEntry; guarded by mu
+	// store holds resolved cache names. It is shared across replicas when backed by
+	// Redis, which is what keeps two replicas from creating the same cache. Its
+	// failures are never fatal: they are logged and treated as a miss.
+	store CacheStore
+
+	// logger records store failures, which are otherwise invisible because the request
+	// proceeds normally.
+	logger *slog.Logger
 
 	// group collapses concurrent resolutions of the same cache key into a single
 	// flight. Without it, N concurrent requests sharing a cached prefix would each
-	// miss the memo and issue their own list+create against Google, since mu is not
-	// held across those calls. The zero value is ready for use.
+	// miss the store and issue their own list+create against Google. This is a
+	// per-replica concern that a shared store does not address: all N would miss the
+	// shared store at the same instant. The zero value is ready for use.
 	group singleflight.Group
 }
 
-// New creates a new CacheResolver. The provided httpClient is used for calls to the
-// Google cachedContents API; pass nil to use the default http.Client.
-func New(httpClient *http.Client) CacheResolver {
+// New creates a new CacheResolver.
+//
+// httpClient is used for calls to the Google cachedContents API; pass nil for a default.
+// store holds resolved cache names; pass nil to disable caching entirely, which makes
+// resolution inert rather than failing requests. logger may be nil.
+func New(httpClient *http.Client, store CacheStore, logger *slog.Logger) CacheResolver {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 30 * time.Second}
 	}
-	return &resolver{
-		httpClient: httpClient,
-		memo:       make(map[string]memoEntry),
+	if store == nil {
+		store = noopStore{}
 	}
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
+	return &resolver{httpClient: httpClient, store: store, logger: logger}
 }
 
 // Resolve implements CacheResolver.
@@ -139,16 +151,18 @@ func (r *resolver) Resolve(ctx context.Context, openAIReq *openai.ChatCompletion
 		return nil, fmt.Errorf("gcpcache: failed to compute cache key: %w", err)
 	}
 
-	// Check in-memory memo first.
-	if entry, ok := r.getMemo(cacheKey); ok {
+	// Check the shared store first. A store failure is not fatal: it is logged and
+	// treated as a miss, so an unreachable store degrades caching rather than the
+	// request. Google-side failures below are a different matter and do fail fast.
+	if e, ok := r.storeGet(ctx, cacheKey); ok {
 		return &ResolveResult{
-			CacheName:  entry.cacheName,
+			CacheName:  e.cacheName,
 			Messages:   remainderMessages,
-			ExpireTime: entry.expireTime,
+			ExpireTime: e.expireTime,
 		}, nil
 	}
 
-	// Memo miss — resolve against Google, collapsing concurrent requests for the same
+	// Store miss — resolve against Google, collapsing concurrent requests for the same
 	// key into a single flight so that N simultaneous misses issue one list+create
 	// rather than N.
 	//
@@ -189,6 +203,11 @@ func (r *resolver) Resolve(ctx context.Context, openAIReq *openai.ChatCompletion
 // absent, then re-list to converge duplicate-create races. It runs inside a singleflight
 // flight, so its result is shared by all concurrent callers for the same key; it therefore
 // leaves ResolveResult.Messages unset for the caller to fill in per-request.
+//
+// Before creating, it claims a store-level lock so that replicas racing on a cold prefix
+// produce one create rather than N. Losing the race means waiting for the winner's result;
+// the wait degrading into a plain resolution is safe, because the list below is the actual
+// source of truth.
 func (r *resolver) resolveUncached(
 	ctx context.Context,
 	openAIReq *openai.ChatCompletionRequest,
@@ -209,24 +228,43 @@ func (r *resolver) resolveUncached(
 	}
 	accessToken := token.AccessToken
 
+	// Claim the right to create this key. A replica that loses waits for the winner's
+	// result; if the winner never publishes one, it falls through and resolves itself.
+	locked := r.tryLock(ctx, cacheKey)
+	if !locked {
+		if e, ok := r.awaitLeader(ctx, cacheKey); ok {
+			return &ResolveResult{CacheName: e.cacheName, ExpireTime: e.expireTime}, nil
+		}
+	}
+
 	// List existing caches and match by displayName (cacheKey).
 	baseURL := fmt.Sprintf(gcpCachedContentsBasePath, region, project, region)
 	existingName, expireTime, err := r.listAndMatch(ctx, baseURL, accessToken, cacheKey, openAIReq.Model)
 	if err != nil {
+		if locked {
+			r.unlock(ctx, cacheKey)
+		}
 		return nil, fmt.Errorf("gcpcache: failed to list cached contents: %w", err)
 	}
 
 	if existingName != "" {
-		r.setMemo(cacheKey, existingName, expireTime)
+		r.storeSet(ctx, cacheKey, entry{cacheName: existingName, expireTime: expireTime})
 		return &ResolveResult{
 			CacheName:  existingName,
 			ExpireTime: expireTime,
 		}, nil
 	}
 
-	// Cache not found — create it.
+	// Cache not found — create it. A replica that did not win the lock still creates
+	// here, having already waited for the winner without result; this is the duplicate
+	// the lock narrows but cannot fully eliminate.
 	created, tokenCount, expireTime, err := r.createCache(ctx, baseURL, accessToken, openAIReq.Model, region, project, cacheKey, contents, systemInstruction, geminiTools, ttl)
 	if err != nil {
+		// Release the claim so waiters retry immediately rather than blocking for the
+		// remainder of the lock TTL on a create that will never publish.
+		if locked {
+			r.unlock(ctx, cacheKey)
+		}
 		return nil, fmt.Errorf("gcpcache: failed to create cached content: %w", err)
 	}
 
@@ -234,20 +272,110 @@ func (r *resolver) resolveUncached(
 	finalName, finalExpire, listErr := r.listAndMatch(ctx, baseURL, accessToken, cacheKey, openAIReq.Model)
 	if listErr == nil && finalName != "" && finalName != created {
 		// Another replica created a cache with the same key; use the one from the list.
-		r.setMemo(cacheKey, finalName, finalExpire)
+		r.storeSet(ctx, cacheKey, entry{cacheName: finalName, expireTime: finalExpire})
 		return &ResolveResult{
 			CacheName:  finalName,
 			ExpireTime: finalExpire,
 		}, nil
 	}
 
-	r.setMemo(cacheKey, created, expireTime)
+	r.storeSet(ctx, cacheKey, entry{cacheName: created, expireTime: expireTime})
 	return &ResolveResult{
 		CacheName:  created,
 		Created:    true,
 		TokenCount: tokenCount,
 		ExpireTime: expireTime,
 	}, nil
+}
+
+// -----------------------------------------------------------------------
+// Store access
+//
+// The resolver never propagates a store failure to its caller: caching is an
+// optimization, and an unreachable store must not turn a servable request into an
+// error. Failures are logged and treated as a miss, leaving Google as the source of
+// truth. Google-side failures are propagated, because those are actionable by the
+// user — a create rejected for being below the model's minimum token count means the
+// cache_control markers are misplaced, and silently serving the request uncached
+// would hide a cost increase.
+// -----------------------------------------------------------------------
+
+// storeGet reads a resolved cache name, reporting a miss on any failure.
+func (r *resolver) storeGet(ctx context.Context, key string) (entry, bool) {
+	e, ok, err := r.store.Get(ctx, key)
+	if err != nil {
+		r.logger.Warn("gcpcache: cache store read failed, proceeding uncached",
+			slog.String("error", err.Error()))
+		return entry{}, false
+	}
+	if !ok {
+		return entry{}, false
+	}
+	// Treat entries expiring within 10s as stale so there is time to re-resolve before
+	// the cache disappears underneath an in-flight request.
+	if time.Until(e.expireTime) < staleThreshold {
+		return entry{}, false
+	}
+	return e, true
+}
+
+// storeSet records a resolved cache name, expiring it with the Google entry itself so
+// the store cannot outlive what it points at.
+func (r *resolver) storeSet(ctx context.Context, key string, e entry) {
+	ttl := time.Until(e.expireTime)
+	if ttl <= 0 {
+		return
+	}
+	if err := r.store.Set(ctx, key, e, ttl); err != nil {
+		r.logger.Warn("gcpcache: cache store write failed",
+			slog.String("error", err.Error()))
+	}
+}
+
+// locker is implemented by stores that can arbitrate cache creation across replicas.
+// Stores that cannot (such as the no-op store) simply never grant a lock, which leaves
+// every caller resolving independently — correct, just without the deduplication.
+type locker interface {
+	tryLock(ctx context.Context, key string) (bool, error)
+	unlock(ctx context.Context, key string)
+	awaitLeader(ctx context.Context, key string) (entry, bool, error)
+}
+
+// tryLock claims the right to create key. It reports false when the store cannot lock,
+// when the lock is held elsewhere, or on failure — all cases where the caller should
+// resolve against Google rather than wait.
+func (r *resolver) tryLock(ctx context.Context, key string) bool {
+	l, ok := r.store.(locker)
+	if !ok {
+		return false
+	}
+	won, err := l.tryLock(ctx, key)
+	if err != nil {
+		r.logger.Warn("gcpcache: cache store lock failed, proceeding without coordination",
+			slog.String("error", err.Error()))
+		return false
+	}
+	return won
+}
+
+func (r *resolver) unlock(ctx context.Context, key string) {
+	if l, ok := r.store.(locker); ok {
+		l.unlock(ctx, key)
+	}
+}
+
+// awaitLeader waits for the replica holding the lock to publish its result.
+func (r *resolver) awaitLeader(ctx context.Context, key string) (entry, bool) {
+	l, ok := r.store.(locker)
+	if !ok {
+		return entry{}, false
+	}
+	e, found, err := l.awaitLeader(ctx, key)
+	if err != nil {
+		// Includes the timeout case: fall through and resolve rather than fail.
+		return entry{}, false
+	}
+	return e, found
 }
 
 // -----------------------------------------------------------------------
@@ -399,31 +527,6 @@ func computeCacheKey(model string, contents []genai.Content, systemInstruction *
 	}
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:]), nil
-}
-
-// -----------------------------------------------------------------------
-// In-memory memo
-// -----------------------------------------------------------------------
-
-func (r *resolver) getMemo(key string) (memoEntry, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	entry, ok := r.memo[key]
-	if !ok {
-		return memoEntry{}, false
-	}
-	// Treat entries expiring within 10 s as stale so we have time to re-resolve.
-	if time.Until(entry.expireTime) < 10*time.Second {
-		delete(r.memo, key)
-		return memoEntry{}, false
-	}
-	return entry, true
-}
-
-func (r *resolver) setMemo(key, cacheName string, expireTime time.Time) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.memo[key] = memoEntry{cacheName: cacheName, expireTime: expireTime}
 }
 
 // -----------------------------------------------------------------------
