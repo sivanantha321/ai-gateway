@@ -7,8 +7,11 @@ package gcpcache
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -97,9 +100,14 @@ type fakeCacheServer struct {
 	listResponse string
 	createStatus int
 	createBody   string
-	listCalls    int
-	createCalls  int
+	// Counters are atomic because the httptest handler runs on a goroutine per
+	// request, and the concurrency tests below drive many at once.
+	listCalls   atomic.Int64
+	createCalls atomic.Int64
 }
+
+func (f *fakeCacheServer) lists() int   { return int(f.listCalls.Load()) }
+func (f *fakeCacheServer) creates() int { return int(f.createCalls.Load()) }
 
 func newFakeCacheServer(t *testing.T, listBody, createBody string, createStatus int) *fakeCacheServer {
 	t.Helper()
@@ -112,11 +120,11 @@ func newFakeCacheServer(t *testing.T, listBody, createBody string, createStatus 
 		w.Header().Set("Content-Type", "application/json")
 		switch r.Method {
 		case http.MethodGet:
-			f.listCalls++
+			f.listCalls.Add(1)
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(f.listResponse))
 		case http.MethodPost:
-			f.createCalls++
+			f.createCalls.Add(1)
 			w.WriteHeader(f.createStatus)
 			_, _ = w.Write([]byte(f.createBody))
 		}
@@ -328,8 +336,8 @@ func TestResolver_CacheMiss_Creates(t *testing.T) {
 	// remainder = messages after the breakpoint (index 0 → only userMsg at index 1 remains)
 	assert.Equal(t, []openai.ChatCompletionMessageParamUnion{userMsg("Hello")}, res.Messages)
 	// list → create → re-list (post-create convergence check)
-	assert.Equal(t, 2, fake.listCalls)
-	assert.Equal(t, 1, fake.createCalls)
+	assert.Equal(t, 2, fake.lists())
+	assert.Equal(t, 1, fake.creates())
 }
 
 func TestResolver_CacheHit_FromGoogleList(t *testing.T) {
@@ -364,7 +372,7 @@ func TestResolver_CacheHit_FromGoogleList(t *testing.T) {
 	require.NotNil(t, res)
 	assert.Equal(t, "projects/p/locations/us-central1/cachedContents/existing", res.CacheName)
 	assert.False(t, res.Created)
-	assert.Equal(t, 0, fake.createCalls)
+	assert.Equal(t, 0, fake.creates())
 }
 
 func TestResolver_MemoHit_SkipsGoogleAPICalls(t *testing.T) {
@@ -387,8 +395,8 @@ func TestResolver_MemoHit_SkipsGoogleAPICalls(t *testing.T) {
 	require.NotNil(t, res)
 	assert.Equal(t, "projects/p/locations/r/cachedContents/memo-hit", res.CacheName)
 	assert.False(t, res.Created)
-	assert.Equal(t, 0, fake.listCalls, "memo hit must not call the Google API")
-	assert.Equal(t, 0, fake.createCalls)
+	assert.Equal(t, 0, fake.lists(), "memo hit must not call the Google API")
+	assert.Equal(t, 0, fake.creates())
 }
 
 func TestResolver_MemoExpiry_Refetches(t *testing.T) {
@@ -422,7 +430,7 @@ func TestResolver_MemoExpiry_Refetches(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, res)
 	assert.Equal(t, "projects/p/locations/us-central1/cachedContents/refreshed", res.CacheName)
-	assert.Equal(t, 1, fake.listCalls, "stale memo must trigger a list call")
+	assert.Equal(t, 1, fake.lists(), "stale memo must trigger a list call")
 }
 
 func TestResolver_CreateFailure_ReturnsError(t *testing.T) {
@@ -571,4 +579,125 @@ func TestResolver_DuplicateCreateRace_UsesListResult(t *testing.T) {
 	assert.Equal(t, "projects/p/locations/us-central1/cachedContents/older-by-other", res.CacheName)
 	// Created should be false when we converged to another replica's cache.
 	assert.False(t, res.Created)
+}
+
+// -----------------------------------------------------------------------
+// Concurrency: singleflight request collapsing
+// -----------------------------------------------------------------------
+
+// resolveConcurrently fires n concurrent Resolve calls built by reqFor and returns
+// the results in completion-independent order (indexed by goroutine).
+func resolveConcurrently(t *testing.T, r *resolver, n int, reqFor func(i int) *openai.ChatCompletionRequest) []*ResolveResult {
+	t.Helper()
+	auth := &fakeGCPAuth{token: "tok", region: "us-central1", project: "p"}
+	results := make([]*ResolveResult, n)
+	errs := make([]error, n)
+
+	// A start barrier maximizes the overlap so the requests genuinely contend
+	// rather than trickling in after the first has already populated the memo.
+	var start, done sync.WaitGroup
+	start.Add(1)
+	done.Add(n)
+	for i := range n {
+		go func() {
+			defer done.Done()
+			start.Wait()
+			results[i], errs[i] = r.Resolve(context.Background(), reqFor(i), auth)
+		}()
+	}
+	start.Done()
+	done.Wait()
+
+	for i := range n {
+		require.NoError(t, errs[i], "goroutine %d", i)
+		require.NotNil(t, results[i], "goroutine %d", i)
+	}
+	return results
+}
+
+func TestResolver_Dogpile_CollapsesToSingleCreate(t *testing.T) {
+	expireISO := time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339)
+	createResp := `{"name":"projects/p/locations/us-central1/cachedContents/new","expireTime":"` + expireISO + `","usageMetadata":{"totalTokenCount":512}}`
+	fake := newFakeCacheServer(t, `{"cachedContents":[]}`, createResp, http.StatusOK)
+	r := resolverWithServer(fake.srv.URL)
+
+	const n = 50
+	results := resolveConcurrently(t, r, n, func(int) *openai.ChatCompletionRequest {
+		return &openai.ChatCompletionRequest{
+			Model: "gemini-1.5-pro",
+			Messages: []openai.ChatCompletionMessageParamUnion{
+				systemMsg("You are helpful.", ephemeralFields()),
+				userMsg("Hello"),
+			},
+		}
+	})
+
+	// Without collapsing, each of the n misses would drive its own list+create.
+	assert.Equal(t, 1, fake.creates(), "concurrent identical requests must create exactly one cache")
+	assert.Equal(t, 2, fake.lists(), "one flight performs list → create → re-list")
+
+	for i, res := range results {
+		assert.Equal(t, "projects/p/locations/us-central1/cachedContents/new", res.CacheName, "goroutine %d", i)
+	}
+}
+
+func TestResolver_Dogpile_OnlyLeaderReportsCreated(t *testing.T) {
+	expireISO := time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339)
+	createResp := `{"name":"projects/p/locations/us-central1/cachedContents/new","expireTime":"` + expireISO + `","usageMetadata":{"totalTokenCount":512}}`
+	fake := newFakeCacheServer(t, `{"cachedContents":[]}`, createResp, http.StatusOK)
+	r := resolverWithServer(fake.srv.URL)
+
+	const n = 50
+	results := resolveConcurrently(t, r, n, func(int) *openai.ChatCompletionRequest {
+		return &openai.ChatCompletionRequest{
+			Model: "gemini-1.5-pro",
+			Messages: []openai.ChatCompletionMessageParamUnion{
+				systemMsg("You are helpful.", ephemeralFields()),
+				userMsg("Hello"),
+			},
+		}
+	})
+
+	// The cache write happened once, so exactly one caller may bill for it. If every
+	// waiter reported Created, the request path would record the write-token count n
+	// times and over-bill the cost this feature exists to reduce.
+	created := 0
+	for i, res := range results {
+		if res.Created {
+			created++
+			assert.Equal(t, 512, res.TokenCount, "the creating request must carry the write token count")
+		} else {
+			assert.Zero(t, res.TokenCount, "goroutine %d did not create the cache and must not bill for it", i)
+		}
+	}
+	assert.Equal(t, 1, created, "exactly one caller may report Created")
+}
+
+func TestResolver_Dogpile_PerCallerMessagesAreIsolated(t *testing.T) {
+	expireISO := time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339)
+	createResp := `{"name":"projects/p/locations/us-central1/cachedContents/new","expireTime":"` + expireISO + `","usageMetadata":{"totalTokenCount":512}}`
+	fake := newFakeCacheServer(t, `{"cachedContents":[]}`, createResp, http.StatusOK)
+	r := resolverWithServer(fake.srv.URL)
+
+	// Same cached prefix (so all share one flight) but a distinct remainder per caller.
+	const n = 50
+	results := resolveConcurrently(t, r, n, func(i int) *openai.ChatCompletionRequest {
+		return &openai.ChatCompletionRequest{
+			Model: "gemini-1.5-pro",
+			Messages: []openai.ChatCompletionMessageParamUnion{
+				systemMsg("You are helpful.", ephemeralFields()),
+				userMsg(fmt.Sprintf("question-%d", i)),
+			},
+		}
+	})
+
+	require.Equal(t, 1, fake.creates(), "the shared prefix must still collapse to one create")
+
+	// singleflight hands the same value to every waiter; each caller must have received
+	// its own copy carrying its own remainder rather than the leader's.
+	for i, res := range results {
+		require.Len(t, res.Messages, 1, "goroutine %d", i)
+		assert.Equal(t, []openai.ChatCompletionMessageParamUnion{userMsg(fmt.Sprintf("question-%d", i))}, res.Messages,
+			"goroutine %d must receive its own remainder", i)
+	}
 }

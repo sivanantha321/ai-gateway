@@ -30,6 +30,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/genai"
 
 	"github.com/envoyproxy/ai-gateway/internal/apischema/gcp"
@@ -86,6 +87,12 @@ type resolver struct {
 
 	mu   sync.Mutex
 	memo map[string]memoEntry // key → memoEntry; guarded by mu
+
+	// group collapses concurrent resolutions of the same cache key into a single
+	// flight. Without it, N concurrent requests sharing a cached prefix would each
+	// miss the memo and issue their own list+create against Google, since mu is not
+	// held across those calls. The zero value is ready for use.
+	group singleflight.Group
 }
 
 // New creates a new CacheResolver. The provided httpClient is used for calls to the
@@ -102,9 +109,6 @@ func New(httpClient *http.Client) CacheResolver {
 
 // Resolve implements CacheResolver.
 func (r *resolver) Resolve(ctx context.Context, openAIReq *openai.ChatCompletionRequest, gcpAuth filterapi.GCPAuthHandler) (*ResolveResult, error) {
-	region := gcpAuth.GCPRegion()
-	project := gcpAuth.GCPProject()
-
 	// Find the last cache_control breakpoint in the message list.
 	breakpoint := findBreakpoint(openAIReq.Messages)
 	if breakpoint < 0 {
@@ -144,6 +148,59 @@ func (r *resolver) Resolve(ctx context.Context, openAIReq *openai.ChatCompletion
 		}, nil
 	}
 
+	// Memo miss — resolve against Google, collapsing concurrent requests for the same
+	// key into a single flight so that N simultaneous misses issue one list+create
+	// rather than N.
+	//
+	// Note that the leader owns the context for the whole flight: if the leader's
+	// request is cancelled, the flight fails for its followers too. That is acceptable
+	// here — followers return an error and the next request re-resolves — and is
+	// preferable to detaching the flight from request cancellation.
+	//
+	// Leadership is captured inside the closure rather than from Do's "shared" return:
+	// shared reports that the value went to more than one caller, and is true for the
+	// leader too, so it cannot distinguish them. The closure body runs only in the
+	// leader's call, so only the leader observes leader == true.
+	var leader bool
+	v, err, _ := r.group.Do(cacheKey, func() (any, error) {
+		leader = true
+		return r.resolveUncached(ctx, openAIReq, gcpAuth, cacheKey, ttl, contents, systemInstruction, geminiTools)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// singleflight hands the same value to every waiter, so copy before mutating:
+	// concurrent callers share a cached prefix but differ in their remainder.
+	result := *(v.(*ResolveResult))
+	result.Messages = remainderMessages
+
+	// Only the flight leader performed the write. If every waiter reported Created,
+	// the request path would record the cache-write token count once per waiter and
+	// over-bill the very cost this feature exists to reduce.
+	if !leader {
+		result.Created = false
+		result.TokenCount = 0
+	}
+	return &result, nil
+}
+
+// resolveUncached performs the Google-side resolution for a cache key: list, create if
+// absent, then re-list to converge duplicate-create races. It runs inside a singleflight
+// flight, so its result is shared by all concurrent callers for the same key; it therefore
+// leaves ResolveResult.Messages unset for the caller to fill in per-request.
+func (r *resolver) resolveUncached(
+	ctx context.Context,
+	openAIReq *openai.ChatCompletionRequest,
+	gcpAuth filterapi.GCPAuthHandler,
+	cacheKey, ttl string,
+	contents []genai.Content,
+	systemInstruction *genai.Content,
+	geminiTools []genai.Tool,
+) (*ResolveResult, error) {
+	region := gcpAuth.GCPRegion()
+	project := gcpAuth.GCPProject()
+
 	// Get access token.
 	tokenSrc := gcpAuth.GCPTokenSource()
 	token, err := tokenSrc.Token()
@@ -163,7 +220,6 @@ func (r *resolver) Resolve(ctx context.Context, openAIReq *openai.ChatCompletion
 		r.setMemo(cacheKey, existingName, expireTime)
 		return &ResolveResult{
 			CacheName:  existingName,
-			Messages:   remainderMessages,
 			ExpireTime: expireTime,
 		}, nil
 	}
@@ -181,7 +237,6 @@ func (r *resolver) Resolve(ctx context.Context, openAIReq *openai.ChatCompletion
 		r.setMemo(cacheKey, finalName, finalExpire)
 		return &ResolveResult{
 			CacheName:  finalName,
-			Messages:   remainderMessages,
 			ExpireTime: finalExpire,
 		}, nil
 	}
@@ -189,7 +244,6 @@ func (r *resolver) Resolve(ctx context.Context, openAIReq *openai.ChatCompletion
 	r.setMemo(cacheKey, created, expireTime)
 	return &ResolveResult{
 		CacheName:  created,
-		Messages:   remainderMessages,
 		Created:    true,
 		TokenCount: tokenCount,
 		ExpireTime: expireTime,
