@@ -3,20 +3,27 @@
 // The full text of the Apache license is available in the LICENSE file at
 // the root of the repo.
 
-// Package gcpcache implements in-process context-cache resolution for GCP Vertex AI (Gemini).
+// Package gcpcache implements context-cache resolution for GCP Vertex AI (Gemini).
 //
 // When a client sends an OpenAI-format request with Anthropic-style cache_control markers,
 // the resolver:
 //  1. Finds the last cache_control breakpoint in the message list.
 //  2. Splits the request into a cached prefix (tools + system + messages up to the breakpoint)
 //     and a non-cached remainder.
-//  3. Generates a deterministic SHA-256 cache key and looks up an in-memory TTL memo.
-//  4. On a memo miss, lists Google cachedContents for the target region and model.
+//  3. Generates a deterministic SHA-256 cache key and looks it up in the CacheStore.
+//  4. On a miss, lists Google cachedContents for the target region and model.
 //  5. Creates the cache entry if not found, then returns the cache resource name and the
 //     non-cached messages.
 //
-// The CacheResolver interface allows the implementation to be replaced with an external
-// cache service in the future without changing the request-path callers.
+// Duplicate creates are suppressed at two levels, because they arise from two different
+// causes. Within a replica, singleflight collapses callers that overlap in time. Across
+// replicas, the CacheStore collapses callers separated by it: it is shared, so the replica
+// that creates a cache publishes the result for the others, and a create lock keeps a cold
+// prefix arriving at N replicas from producing N creates. A store is not a substitute for
+// singleflight — concurrent callers all miss the shared store at the same instant.
+//
+// Store failures are never fatal to a request: they are logged and treated as a miss,
+// leaving Google as the source of truth. Google-side failures are propagated.
 package gcpcache
 
 import (
@@ -97,7 +104,7 @@ type resolver struct {
 	// flight. Without it, N concurrent requests sharing a cached prefix would each
 	// miss the store and issue their own list+create against Google. This is a
 	// per-replica concern that a shared store does not address: all N would miss the
-	// shared store at the same instant. The zero value is ready for use.
+	// shared store at the same instant.
 	group singleflight.Group
 }
 
@@ -153,7 +160,7 @@ func (r *resolver) Resolve(ctx context.Context, openAIReq *openai.ChatCompletion
 
 	// Check the shared store first. A store failure is not fatal: it is logged and
 	// treated as a miss, so an unreachable store degrades caching rather than the
-	// request. Google-side failures below are a different matter and do fail fast.
+	// request. Google-side failures do fail fast.
 	if e, ok := r.storeGet(ctx, cacheKey); ok {
 		return &ResolveResult{
 			CacheName:  e.cacheName,
@@ -162,19 +169,14 @@ func (r *resolver) Resolve(ctx context.Context, openAIReq *openai.ChatCompletion
 		}, nil
 	}
 
-	// Store miss — resolve against Google, collapsing concurrent requests for the same
-	// key into a single flight so that N simultaneous misses issue one list+create
-	// rather than N.
+	// Store miss — resolve against Google, collapsing concurrent misses for the same key
+	// into one list+create.
 	//
-	// Note that the leader owns the context for the whole flight: if the leader's
-	// request is cancelled, the flight fails for its followers too. That is acceptable
-	// here — followers return an error and the next request re-resolves — and is
-	// preferable to detaching the flight from request cancellation.
+	// The leader owns the context: cancelling its request fails the flight for the
+	// followers too, who then return an error and re-resolve on the next request.
 	//
-	// Leadership is captured inside the closure rather than from Do's "shared" return:
-	// shared reports that the value went to more than one caller, and is true for the
-	// leader too, so it cannot distinguish them. The closure body runs only in the
-	// leader's call, so only the leader observes leader == true.
+	// Leadership is captured inside the closure because Do's "shared" return is true for
+	// the leader as well and so cannot identify followers. Only the leader runs the body.
 	var leader bool
 	v, err, _ := r.group.Do(cacheKey, func() (any, error) {
 		leader = true

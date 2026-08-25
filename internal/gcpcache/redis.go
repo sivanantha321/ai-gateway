@@ -152,10 +152,10 @@ func (s *redisStore) awaitLeader(ctx context.Context, key string) (entry, bool, 
 			v, err := s.client.Get(ctx, key).Result()
 			if err != nil {
 				if errors.Is(err, redis.Nil) {
-					// The leader released without publishing; caller should resolve.
+					// The leader released the lock without publishing; caller should resolve.
 					return entry{}, false, errLockHeld
 				}
-				return entry{}, false, fmt.Errorf("gcpcache: redis get: %w", err)
+				return entry{}, false, fmt.Errorf("gcpcache: redis get failed: %w", err)
 			}
 			if v == lockSentinel {
 				continue // Still creating.
